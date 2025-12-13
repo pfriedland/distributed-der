@@ -1,0 +1,63 @@
+sites:
+  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "Jersey"
+    location: "Region-A"
+  - id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-2"
+    location: "Region-B"
+  - id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-3"
+    location: "Region-C"
+
+assets:
+  # Two BESS at Site-1
+  - id: "7ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-1"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120
+    max_mw: 60
+    min_mw: -60
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000
+  - id: "8ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-1B"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90
+    max_mw: 45
+    min_mw: -45
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000
+
+  # Remaining BESS across other sites
+  - id: "7ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-2"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80
+    max_mw: 40
+    min_mw: -40
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000
+  - id: "7ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-3"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 150
+    max_mw: 75
+    min_mw: -75
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000
+  - id: "7ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-4"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110
+    max_mw: 55
+    min_mw: -55
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000
+  - id: "7ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-5"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 51
+    max_mw: 45
+    min_mw: -45
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000

@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: timescale/timescaledb:2.15.2-pg15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bess
+      POSTGRES_PASSWORD: besspassword
+      POSTGRES_DB: bess
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
