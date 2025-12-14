@@ -1,5 +1,11 @@
 # Distributed DER Management Systems
 
+## Current Architecture Snapshot and Direction
+
+- **Current baseline (what many utilities have today)**: Central SCADA as headend; PI connectors at sites feeding a central PI server (often integrated with SCADA). Inbound connectivity is required to sites. Failure modes include stale/missing points in PI (connector/network hiccups, polling limits), large fault domains (SCADA/PI outages stall fleet visibility/control), brittle onboarding for new assets/markets, and slow change control.
+- **Simulator we’re running**: A single headend combines REST API, dispatch logic, telemetry ingest, outbound gRPC to agents, and Postgres persistence. Edge agents initiate all connectivity (no inbound exposure), receive setpoints, and push telemetry; a launcher spawns one agent per asset from `assets.yaml`. The headend tick loop can be disabled if you want agent-only telemetry.
+- **Direction**: Evolve toward a distributed control plane that separates API/gateway, orchestration, and data/event layers; rely on outbound-only agents; introduce durable event buses; add auth/tenant boundaries; and shrink fault domains while improving data quality and resilience.
+
 ## Legacy SCADA and Data Historian Comparison
 
 Legacy SCADA and data historian platforms were designed for vertically integrated utilities operating a limited number of centralized assets. These systems assume static compute topology, continuous connectivity, scalability constraints, and infrequent change. Modern DER portfolios invalidate those assumptions.
