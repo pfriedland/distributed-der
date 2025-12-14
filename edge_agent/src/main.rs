@@ -14,7 +14,7 @@ use chrono::{SecondsFormat, Utc};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use sim_core::{tick_asset, Asset, BessState, Telemetry};
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -24,7 +24,7 @@ pub mod proto {
 }
 use proto::{
     agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent, AgentToHeadend,
-    HeadendToAgent, Register, Setpoint,
+    HeadendToAgent, Register, Setpoint, Heartbeat,
 };
 
 #[derive(Clone)]
@@ -34,6 +34,7 @@ struct AppState {
     asset: Arc<Asset>,
     sim: Arc<RwLock<BessState>>,
     headend_grpc: String,
+    setpoint_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 #[tokio::main]
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
         asset: Arc::new(asset),
         sim: Arc::new(RwLock::new(sim_state)),
         headend_grpc: cfg.headend_grpc.clone(),
+        setpoint_timer: Arc::new(RwLock::new(None)),
     };
 
     // Start the tick + gRPC stream in the background.
@@ -101,17 +103,33 @@ async fn run_grpc_loop(state: AppState) -> Result<()> {
                         tokio::spawn(async move {
                             while let Some(Ok(msg)) = inbound.next().await {
                                 if let Some(headend_to_agent::Msg::Setpoint(sp)) = msg.msg {
-                                    let mut sim = setpoint_state.sim.write().await;
-                                    sim.setpoint_mw = sp.mw;
-                                    tracing::info!(
-                                        "applied setpoint from headend: mw={} asset={} site={}",
-                                        sp.mw,
-                                        setpoint_state.asset.name,
-                                        setpoint_state.asset.site_name
-                                    );
+                                    apply_setpoint(&setpoint_state, &sp).await;
                                 }
                             }
                             tracing::warn!("setpoint stream ended; will reconnect");
+                        });
+
+                        // Heartbeat task: every 30s send a heartbeat to the headend.
+                        let hb_tx = tx.clone();
+                        let hb_state = state.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                if hb_tx
+                                    .send(AgentToHeadend {
+                                        msg: Some(agent_to_headend::Msg::Heartbeat(Heartbeat {
+                                            asset_id: hb_state.asset.id.to_string(),
+                                            timestamp: Utc::now()
+                                                .to_rfc3339_opts(SecondsFormat::Millis, true),
+                                        })),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::warn!("heartbeat channel closed; reconnecting");
+                                    break;
+                                }
+                            }
                         });
 
                         // Tick loop: every 4s send telemetry upstream.
@@ -167,6 +185,44 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         min_mw: t.min_mw,
         status: t.status.clone(),
     }
+}
+
+async fn apply_setpoint(state: &AppState, sp: &Setpoint) {
+    // Update the immediate setpoint.
+    {
+        let mut sim = state.sim.write().await;
+        sim.setpoint_mw = sp.mw;
+    }
+
+    // Cancel any prior duration timer.
+    if let Some(handle) = state.setpoint_timer.write().await.take() {
+        handle.abort();
+    }
+
+    // If a duration is provided, schedule a reset to 0 MW after it elapses.
+    if let Some(dur) = sp.duration_s {
+        let duration = Duration::from_secs(dur);
+        let timer_state = state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            let mut sim = timer_state.sim.write().await;
+            sim.setpoint_mw = 0.0;
+            tracing::info!(
+                "setpoint duration elapsed; reset to 0 MW for asset={} site={}",
+                timer_state.asset.name,
+                timer_state.asset.site_name
+            );
+        });
+        *state.setpoint_timer.write().await = Some(handle);
+    }
+
+    tracing::info!(
+        "applied setpoint from headend: mw={} duration_s={:?} asset={} site={}",
+        sp.mw,
+        sp.duration_s,
+        state.asset.name,
+        state.asset.site_name
+    );
 }
 
 /// Configuration for the agent (env-driven to keep the binary simple).

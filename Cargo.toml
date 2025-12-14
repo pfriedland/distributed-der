@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = [
   "der_control_plane",
   "der_headend",
@@ -7,4 +8,3 @@ members = [
   "telemetry_event_layer",
   "agent_launcher",
 ]
-workspace.resolver = "3"

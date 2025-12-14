@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -41,6 +41,7 @@ pub mod proto {
 use proto::{
     agent_link_server::{AgentLink, AgentLinkServer},
     agent_to_headend, headend_to_agent, AgentToHeadend, HeadendToAgent, Register, Setpoint,
+    Heartbeat,
 };
 
 #[derive(Clone)]
@@ -239,8 +240,12 @@ async fn main() -> Result<()> {
 
     // Load assets from YAML (with beginner-friendly error messages).
     let assets = load_assets_from_yaml().await?;
-    let simulator = Simulator::from_assets(assets);
+    let simulator = Simulator::from_assets(assets.clone());
     let db = maybe_connect_db().await?;
+    if let Some(db) = db.as_ref() {
+        // Persist asset metadata so history queries can include names/locations.
+        persist_assets(db, &assets).await?;
+    }
 
     // Wrap shared state in Arc<RwLock> for Axum handlers and the tick loop.
     let state = AppState {
@@ -264,6 +269,9 @@ async fn main() -> Result<()> {
         .route("/telemetry/{id}/history", get(history_telemetry))
         .route("/telemetry", post(ingest_telemetry))
         .route("/dispatch", post(create_dispatch))
+        .route("/dispatch/history", get(list_dispatch_history))
+        .route("/heartbeat/{id}", get(latest_heartbeat))
+        .route("/heartbeat/{id}/history", get(history_heartbeats))
         .with_state(state.clone())
         .layer(
             TraceLayer::new_for_http()
@@ -445,6 +453,13 @@ impl AgentLink for GrpcApi {
                             tracing::warn!("telemetry ingest failed: {err}");
                         }
                     }
+                    Ok(AgentToHeadend {
+                        msg: Some(agent_to_headend::Msg::Heartbeat(hb)),
+                    }) => {
+                        if let Err(err) = handle_agent_heartbeat(&state, hb).await {
+                            tracing::warn!("heartbeat handling failed: {err}");
+                        }
+                    }
                     Ok(_) => {}
                     Err(err) => {
                         tracing::info!(
@@ -514,6 +529,18 @@ async fn handle_agent_telemetry(state: &AppState, t: proto::Telemetry) -> Result
         persist_telemetry(db, &[snap]).await?;
     }
 
+    Ok(())
+}
+
+async fn handle_agent_heartbeat(state: &AppState, hb: proto::Heartbeat) -> Result<()> {
+    let asset_id = Uuid::parse_str(&hb.asset_id)?;
+    let ts = DateTime::parse_from_rfc3339(&hb.timestamp)
+        .map(|dt| dt.with_timezone(&Utc))
+        .context("parsing heartbeat timestamp")?;
+
+    if let Some(db) = state.db.as_ref() {
+        persist_heartbeat(db, asset_id, ts).await?;
+    }
     Ok(())
 }
 
@@ -593,6 +620,23 @@ async fn init_db(pool: &PgPool) -> Result<()> {
     .await
     .context("creating agent_sessions table")?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS dispatches (
+            id uuid PRIMARY KEY,
+            asset_id uuid NOT NULL,
+            mw double precision NOT NULL,
+            duration_s bigint,
+            status text NOT NULL,
+            reason text,
+            submitted_at timestamptz NOT NULL
+        );
+    "#,
+    )
+    .execute(pool)
+    .await
+    .context("creating dispatches table")?;
+
     // Best-effort add missing columns if the table already existed.
     // Add missing columns individually to avoid multi-statement prepared issues.
     sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS asset_name text;"#)
@@ -607,6 +651,18 @@ async fn init_db(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("altering agent_sessions.disconnected_at")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            asset_id uuid NOT NULL,
+            ts timestamptz NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("creating heartbeats table")?;
     Ok(())
 }
 
@@ -636,6 +692,79 @@ async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()> {
         .await
         .context("inserting telemetry row")?;
     }
+    Ok(())
+}
+
+async fn persist_assets(pool: &PgPool, assets: &[Asset]) -> Result<()> {
+    // Upsert asset metadata so history queries can join for names.
+    for asset in assets {
+        sqlx::query(
+            r#"
+            INSERT INTO assets (
+                id, site_id, name, site_name, location, capacity_mwhr,
+                max_mw, min_mw, efficiency, ramp_rate_mw_per_min
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (id) DO UPDATE SET
+                site_id = EXCLUDED.site_id,
+                name = EXCLUDED.name,
+                site_name = EXCLUDED.site_name,
+                location = EXCLUDED.location,
+                capacity_mwhr = EXCLUDED.capacity_mwhr,
+                max_mw = EXCLUDED.max_mw,
+                min_mw = EXCLUDED.min_mw,
+                efficiency = EXCLUDED.efficiency,
+                ramp_rate_mw_per_min = EXCLUDED.ramp_rate_mw_per_min
+        "#,
+        )
+        .bind(asset.id)
+        .bind(asset.site_id)
+        .bind(&asset.name)
+        .bind(&asset.site_name)
+        .bind(&asset.location)
+        .bind(asset.capacity_mwhr)
+        .bind(asset.max_mw)
+        .bind(asset.min_mw)
+        .bind(asset.efficiency)
+        .bind(asset.ramp_rate_mw_per_min)
+        .execute(pool)
+        .await
+        .context("upserting asset")?;
+    }
+    Ok(())
+}
+
+async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(d.id)
+    .bind(d.asset_id)
+    .bind(d.mw)
+    .bind(d.duration_s.map(|v| v as i64))
+    .bind(&d.status)
+    .bind(&d.reason)
+    .bind(d.submitted_at)
+    .execute(pool)
+    .await
+    .context("inserting dispatch row")?;
+    Ok(())
+}
+
+async fn persist_heartbeat(pool: &PgPool, asset_id: Uuid, ts: DateTime<Utc>) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO heartbeats (asset_id, ts)
+        VALUES ($1, $2)
+        "#,
+    )
+    .bind(asset_id)
+    .bind(ts)
+    .execute(pool)
+    .await
+    .context("inserting heartbeat")?;
     Ok(())
 }
 
@@ -673,6 +802,8 @@ async fn latest_telemetry(
 #[derive(Serialize, sqlx::FromRow)]
 struct TelemetryRow {
     ts: DateTime<Utc>,
+    asset_name: String,
+    site_name: String,
     soc_mwhr: f64,
     soc_pct: f64,
     capacity_mwhr: f64,
@@ -685,9 +816,24 @@ struct TelemetryRow {
     site_id: Uuid,
 }
 
+#[derive(Debug, Deserialize)]
+struct TimeRange {
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct HeartbeatRow {
+    asset_id: Uuid,
+    ts: DateTime<Utc>,
+    asset_name: String,
+    site_name: String,
+}
+
 async fn history_telemetry(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(range): Query<TimeRange>,
 ) -> Response {
     // If we don't have a DB configured, return an empty history so callers
     // don't get a 501. Beginners: this keeps the API predictable even in
@@ -695,17 +841,55 @@ async fn history_telemetry(
     let Some(db) = state.db.as_ref() else {
         return Json(Vec::<TelemetryRow>::new()).into_response();
     };
-    let rows = sqlx::query_as::<_, TelemetryRow>(
+    // Parse optional start/end params as RFC3339.
+    let start = match range.start {
+        Some(ref s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+    let end = match range.end {
+        Some(ref s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+
+    let mut builder = sqlx::QueryBuilder::new(
         r#"
-        SELECT * FROM telemetry
-        WHERE asset_id = $1
-        ORDER BY ts DESC
-        LIMIT 100
-    "#,
-    )
-    .bind(id)
-    .fetch_all(db)
-    .await;
+        SELECT
+            t.ts,
+            COALESCE(a.name, '<unknown>') AS asset_name,
+            COALESCE(a.site_name, '<unknown>') AS site_name,
+            t.soc_mwhr,
+            t.soc_pct,
+            t.capacity_mwhr,
+            t.current_mw,
+            t.setpoint_mw,
+            t.max_mw,
+            t.min_mw,
+            t.status,
+            t.asset_id,
+            t.site_id
+        FROM telemetry t
+        LEFT JOIN assets a ON t.asset_id = a.id
+        WHERE t.asset_id = "#,
+    );
+    builder.push_bind(id);
+    if let Some(start) = start {
+        builder.push(" AND t.ts >= ").push_bind(start);
+    }
+    if let Some(end) = end {
+        builder.push(" AND t.ts <= ").push_bind(end);
+    }
+    builder.push(" ORDER BY t.ts DESC LIMIT 100");
+
+    let rows = builder
+        .build_query_as::<TelemetryRow>()
+        .fetch_all(db)
+        .await;
 
     match rows {
         Ok(rows) => Json(rows).into_response(),
@@ -789,19 +973,14 @@ async fn create_dispatch(
             }
 
             // Return a simple JSON acknowledgment.
-            #[derive(Serialize)]
-            struct Ack<'a> {
-                status: &'a str,
-                asset_id: Uuid,
-                mw: f64,
-                duration_s: Option<u64>,
+            // Persist dispatch to DB if available.
+            if let Some(db) = state.db.as_ref() {
+                if let Err(err) = persist_dispatch(db, &dispatch).await {
+                    tracing::warn!("failed to persist dispatch: {err}");
+                }
             }
-            Json(Ack {
-                status: "ok",
-                asset_id: dispatch.asset_id,
-                mw: dispatch.mw,
-                duration_s: dispatch.duration_s,
-            })
+
+            Json(dispatch)
             .into_response()
         }
         Err(err) => {
@@ -892,18 +1071,207 @@ struct AgentView {
     asset_name: String,
     site_name: String,
     peer: String,
+    connected: bool,
+    sessions: Vec<AgentSessionView>,
+}
+
+#[derive(Serialize)]
+struct AgentSessionView {
+    peer: String,
+    connected_at: DateTime<Utc>,
+    disconnected_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AgentSessionRow {
+    asset_id: Uuid,
+    asset_name: Option<String>,
+    site_name: Option<String>,
+    peer: String,
+    connected_at: DateTime<Utc>,
+    disconnected_at: Option<DateTime<Utc>>,
 }
 
 async fn list_agents(State(state): State<AppState>) -> Response {
-    let agents = state.agent_streams.read().await;
-    let list: Vec<AgentView> = agents
-        .iter()
-        .map(|(id, s)| AgentView {
-            asset_id: *id,
-            asset_name: s.asset_name.clone(),
-            site_name: s.site_name.clone(),
-            peer: s.peer.clone(),
-        })
-        .collect();
+    // Current connections (in-memory).
+    let current = state.agent_streams.read().await.clone();
+
+    // Recent sessions from DB (if available); limited to last 5 per asset.
+    let mut history: HashMap<Uuid, Vec<AgentSessionView>> = HashMap::new();
+    let mut names: HashMap<Uuid, (String, String)> = HashMap::new();
+    if let Some(db) = state.db.as_ref() {
+        if let Ok(rows) = sqlx::query_as::<_, AgentSessionRow>(
+            r#"
+            SELECT asset_id, asset_name, site_name, peer, connected_at, disconnected_at
+            FROM agent_sessions
+            ORDER BY connected_at DESC
+            LIMIT 200
+            "#,
+        )
+        .fetch_all(db)
+        .await
+        {
+            for row in rows {
+                let entry = history.entry(row.asset_id).or_default();
+                if entry.len() < 5 {
+                    entry.push(AgentSessionView {
+                        peer: row.peer,
+                        connected_at: row.connected_at,
+                        disconnected_at: row.disconnected_at,
+                    });
+                }
+                names.insert(
+                    row.asset_id,
+                    (
+                        row.asset_name.unwrap_or_else(|| "<unknown>".into()),
+                        row.site_name.unwrap_or_else(|| "<unknown>".into()),
+                    ),
+                );
+            }
+        }
+    }
+
+    // Merge current status with history; ensure current peer is first if connected.
+    let mut list = Vec::new();
+    for (asset_id, stream) in current.iter() {
+        let mut sessions = history.remove(asset_id).unwrap_or_default();
+        // Prepend current session info.
+        sessions.insert(
+            0,
+            AgentSessionView {
+                peer: stream.peer.clone(),
+                connected_at: Utc::now(),
+                disconnected_at: None,
+            },
+        );
+        list.push(AgentView {
+            asset_id: *asset_id,
+            asset_name: stream.asset_name.clone(),
+            site_name: stream.site_name.clone(),
+            peer: stream.peer.clone(),
+            connected: true,
+            sessions,
+        });
+    }
+
+    // Include recent but currently disconnected agents (from history only).
+    for (asset_id, sessions) in history.into_iter() {
+        let (asset_name, site_name) = names
+            .get(&asset_id)
+            .cloned()
+            .unwrap_or_else(|| ("<unknown>".into(), "<unknown>".into()));
+        list.push(AgentView {
+            asset_id,
+            asset_name,
+            site_name,
+            peer: sessions.first().map(|s| s.peer.clone()).unwrap_or_else(|| "<not_connected>".into()),
+            connected: false,
+            sessions,
+        });
+    }
+
     Json(list).into_response()
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct DispatchRow {
+    id: Uuid,
+    asset_id: Uuid,
+    mw: f64,
+    duration_s: Option<i64>,
+    status: String,
+    reason: Option<String>,
+    submitted_at: DateTime<Utc>,
+}
+
+/// Return recent dispatch records (DB-backed). Empty array if no DB configured.
+async fn list_dispatch_history(State(state): State<AppState>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return Json(Vec::<DispatchRow>::new()).into_response();
+    };
+    let rows = sqlx::query_as::<_, DispatchRow>(
+        r#"
+        SELECT id, asset_id, mw, duration_s, status, reason, submitted_at
+        FROM dispatches
+        ORDER BY submitted_at DESC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(db)
+    .await;
+
+    match rows {
+        Ok(list) => Json(list).into_response(),
+        Err(err) => {
+            tracing::error!("dispatch history query failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Latest heartbeat for an asset.
+async fn latest_heartbeat(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let row = sqlx::query_as::<_, HeartbeatRow>(
+        r#"
+        SELECT
+            h.asset_id,
+            h.ts,
+            COALESCE(a.name, '<unknown>') AS asset_name,
+            COALESCE(a.site_name, '<unknown>') AS site_name
+        FROM heartbeats h
+        LEFT JOIN assets a ON h.asset_id = a.id
+        WHERE h.asset_id = $1
+        ORDER BY h.ts DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await;
+
+    match row {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("heartbeat latest query failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Last 100 heartbeats for an asset.
+async fn history_heartbeats(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return Json(Vec::<HeartbeatRow>::new()).into_response();
+    };
+
+    let rows = sqlx::query_as::<_, HeartbeatRow>(
+        r#"
+        SELECT
+            h.asset_id,
+            h.ts,
+            COALESCE(a.name, '<unknown>') AS asset_name,
+            COALESCE(a.site_name, '<unknown>') AS site_name
+        FROM heartbeats h
+        LEFT JOIN assets a ON h.asset_id = a.id
+        WHERE h.asset_id = $1
+        ORDER BY h.ts DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await;
+
+    match rows {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => {
+            tracing::error!("heartbeat history query failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }

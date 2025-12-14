@@ -24,6 +24,11 @@ message Telemetry {
   string status = 12;
 }
 
+message Heartbeat {
+  string asset_id = 1;
+  string timestamp = 2;
+}
+
 message Setpoint {
   string asset_id = 1;
   double mw = 2;
@@ -34,6 +39,7 @@ message AgentToHeadend {
   oneof msg {
     Register register = 1;
     Telemetry telemetry = 2;
+    Heartbeat heartbeat = 3;
   }
 }
 

@@ -62,14 +62,19 @@ This document captures the current MVP architecture of the distributed DER simul
 
 - **der_headend**  
   - HTTP endpoints:  
+    - `GET /` – minimal HTML placeholder pointing to API routes.  
     - `GET /assets` – list assets (from `assets.yaml`).  
       - Example: `curl http://127.0.0.1:3001/assets`  
     - `GET /telemetry/{id}` – latest telemetry (agent-pushed if present, else synthesized).  
       - Example: `curl http://127.0.0.1:3001/telemetry/<ASSET_ID>`  
     - `GET /telemetry/{id}/history` – last 100 rows from DB (empty array if no DB).  
       - Example: `curl http://127.0.0.1:3001/telemetry/<ASSET_ID>/history`  
+    - `POST /telemetry` – ingest telemetry via HTTP (stored in-memory and optionally persisted).  
+      - Example: `curl -X POST http://127.0.0.1:3001/telemetry -H 'content-type: application/json' -d @snap.json`  
     - `POST /dispatch` – set setpoint (JSON ack; logs asset/site, limits, connection state).  
       - Example: `curl -X POST http://127.0.0.1:3001/dispatch -H 'content-type: application/json' -d '{"asset_id":"<ASSET_ID>","mw":10.0}'`  
+    - `GET /dispatch/history` – recent dispatches (empty array if no DB).  
+      - Example: `curl http://127.0.0.1:3001/dispatch/history`  
     - `GET /agents` – current connected agents (asset_id, asset_name, site_name, peer).  
       - Example: `curl http://127.0.0.1:3001/agents`  
   - gRPC: `AgentLink::Stream` (agent-initiated). Agents send Register + Telemetry; headend pushes Setpoint.  
