@@ -63,14 +63,19 @@ This document captures the current MVP architecture of the distributed DER simul
 - **der_headend**  
   - HTTP endpoints:  
     - `GET /assets` – list assets (from `assets.yaml`).  
+      - Example: `curl http://127.0.0.1:3001/assets`  
     - `GET /telemetry/{id}` – latest telemetry (agent-pushed if present, else synthesized).  
+      - Example: `curl http://127.0.0.1:3001/telemetry/<ASSET_ID>`  
     - `GET /telemetry/{id}/history` – last 100 rows from DB (empty array if no DB).  
+      - Example: `curl http://127.0.0.1:3001/telemetry/<ASSET_ID>/history`  
     - `POST /dispatch` – set setpoint (JSON ack; logs asset/site, limits, connection state).  
+      - Example: `curl -X POST http://127.0.0.1:3001/dispatch -H 'content-type: application/json' -d '{"asset_id":"<ASSET_ID>","mw":10.0}'`  
     - `GET /agents` – current connected agents (asset_id, asset_name, site_name, peer).  
+      - Example: `curl http://127.0.0.1:3001/agents`  
   - gRPC: `AgentLink::Stream` (agent-initiated). Agents send Register + Telemetry; headend pushes Setpoint.  
   - Persistence (optional, Postgres): tables `assets`, `telemetry`, `agent_sessions` (asset_id, peer, asset/site names, connect/disconnect timestamps).  
   - Agent registry: in-memory map of active streams with peer + asset/site names; sessions persisted on connect/disconnect.  
-  - Tick loop: can be disabled for agent-only telemetry to avoid duplicate data.
+  - Tick loop: can be disabled for agent-only telemetry to avoid duplicate data.  
 
 - **edge_agent**  
   - Outbound-only gRPC to headend; reconnects with backoff.  
