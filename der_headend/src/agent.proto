@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package agent;
+
+message Register {
+  string asset_id = 1;
+  string site_id = 2;
+  string asset_name = 3;
+  string site_name = 4;
+}
+
+message Telemetry {
+  string asset_id = 1;
+  string site_id = 2;
+  string site_name = 3;
+  string timestamp = 4;
+  double soc_mwhr = 5;
+  double soc_pct = 6;
+  double capacity_mwhr = 7;
+  double current_mw = 8;
+  double setpoint_mw = 9;
+  double max_mw = 10;
+  double min_mw = 11;
+  string status = 12;
+}
+
+message Setpoint {
+  string asset_id = 1;
+  double mw = 2;
+  optional uint64 duration_s = 3;
+}
+
+message AgentToHeadend {
+  oneof msg {
+    Register register = 1;
+    Telemetry telemetry = 2;
+  }
+}
+
+message HeadendToAgent {
+  oneof msg {
+    Setpoint setpoint = 1;
+  }
+}
+
+service AgentLink {
+  rpc Stream(stream AgentToHeadend) returns (stream HeadendToAgent);
+}

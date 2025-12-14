@@ -1,20 +1,9 @@
-[package]
-name = "bess_simulator"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-anyhow = "1.0"
-axum = "0.8.7"
-chrono = { version = "0.4", features = ["serde", "clock"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
-thiserror = "1.0"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+[workspace]
+members = [
+  "der_control_plane",
+  "der_headend",
+  "edge_agent",
+  "sim_core",
+  "telemetry_event_layer",
+]
+workspace.resolver = "3"
