@@ -1,8 +1,8 @@
-# DESIGN_HIGHLEVEL.md
+# Distributed DER Management Systems
 
 ## Legacy SCADA and Data Historian Comparison
 
-Legacy SCADA and data historian platforms were designed for vertically integrated utilities operating a limited number of centralized assets. These systems assume static compute topology, continuous connectivity, and infrequent change. Modern DER portfolios invalidate those assumptions.
+Legacy SCADA and data historian platforms were designed for vertically integrated utilities operating a limited number of centralized assets. These systems assume static compute topology, continuous connectivity, scalability constraints, and infrequent change. Modern DER portfolios invalidate those assumptions.
 
 ### Operational Differences
 
@@ -44,7 +44,7 @@ As a result, many organizations retain a **minimal, tightly scoped SCADA footpri
 ### Recommended Boundary
 
 In this architecture:
-- Legacy SCADA is retained **only** as an ICCP gateway
+- Legacy SCADA is retained **only** as an ICCP and RTU gateways
 - It is not used for DER-level control, optimization, or analytics
 - It interfaces with the SaaS DER platform via controlled, auditable data exchanges
 
@@ -56,7 +56,7 @@ This sharply reduces:
 
 ### Strategic Outcome
 
-SCADA becomes a **compliance interface**, not the operational core.  
+SCADA becomes a **compliance interface**, focused on reliability requirements not the operational core.  
 The SaaS DER platform assumes responsibility for:
 - Fleet orchestration
 - Market optimization
@@ -116,7 +116,7 @@ Key principles used to manage CIP exposure:
 - No inbound connectivity required to DER sites
 - Cloud services operate outside BES Cyber System definitions
 - Edge agents enforce least-privilege communication
-- Legacy SCADA remains the sole ICCP/BES interface
+- Legacy SCADA remains the sole ICCP/RTU BES interface
 
 By design, the SaaS platform minimizes the number of assets that could be classified as BES Cyber Assets or BES Cyber Systems.
 
@@ -246,14 +246,14 @@ This appendix provides a high-level mapping of the proposed SaaS DER Management 
 The architecture is intentionally designed to:
 - Minimize the number of assets in CIP scope
 - Avoid classification of DER field assets as Medium Impact BES Cyber Systems
-- Constrain CIP applicability primarily to legacy SCADA components retained for ICCP integration
+- Constrain CIP applicability primarily to legacy SCADA components retained for ICCP and RTU integration
 
 ### Architectural Scope Assumptions
 
-- **Cloud data centers hosting the SaaS control plane are architected to remain outside BES Cyber System classification due to lack of BES control authority, ICCP participation, or routable ESP connectivity**
-- **On-site DERs and edge agents are not Medium Impact BES Cyber Assets**
-- **Legacy SCADA systems used for ICCP remain the primary BES Cyber Systems**
-- **ICCP links and DMZ define the BES boundary**
+- **Cloud data centers hosting the SaaS control plane are architected to remain outside BES Cyber System classification due to lack of BES control authority, ICCP or RTU participation, or routable ESP connectivity**
+- **On-site DERs and edge agents are not Medium Impact BES Cyber Assets **
+- **Legacy SCADA systems used for ICCP and RTU communications remain the primary BES Cyber Systems**
+- **ICCP links, RTU front ends, and DMZs define the BES boundary**
 
 - Cloud data centers are not BES Cyber Assets in this design not because they are cloud, but because:
     - They do not perform BES control functions
@@ -269,7 +269,7 @@ This aligns with common ISO/RTO and utility interpretations.
 
 ### CIP-002: BES Cyber System Categorization
 
-- Legacy SCADA systems supporting ICCP are categorized per existing utility processes
+- Legacy SCADA systems supporting ICCP and RTU front-ends are categorized per existing utility processes
 - Cloud-hosted DER Management services are architected outside BES Cyber System definitions
 - DER field devices remain non-BES Cyber Assets due to:
   - Limited functionality
@@ -307,7 +307,7 @@ Smaller pool of CIP-trained personnel required.
 
 ### CIP-005: Electronic Security Perimeters (ESP)
 
-- ESPs are defined around legacy SCADA and ICCP endpoints
+- ESPs are defined around legacy SCADA, RTU Front-Ends, and ICCP endpoints
 - No inbound connectivity to DER sites
 - No direct network paths from cloud services into ESPs
 
@@ -331,11 +331,12 @@ Physical security scope remains unchanged or reduced.
 ### CIP-007: System Security Management
 
 - Patch management and vulnerability handling focused on:
-  - SCADA servers
+  - SCADA and related servers
   - ICCP interfaces
 - Cloud services leverage:
   - Immutable infrastructure
   - Rapid patch deployment
+  - Isolated networking compute zones
   - Automated vulnerability remediation
 
 **Outcome:**  
@@ -359,7 +360,7 @@ Cleaner incident classification and response.
 
 - Recovery plans maintained for legacy SCADA
 - SaaS platform recovery handled via:
-  - Redundant cloud regions
+  - Redundant cloud zones or regions
   - Stateless services
   - Automated redeployment
 
@@ -413,7 +414,7 @@ Lower long-term supply chain risk.
 
 This architecture:
 - Minimizes Medium Impact CIP scope
-- Preserves required ICCP integrations
+- Preserves required ICCP and RTU Front-end integrations
 - Reduces audit surface area
 - Improves cybersecurity posture without increasing compliance burden
 
@@ -462,22 +463,22 @@ ICCP <--> ISO["ISO / RTO"]
 ## Appendix C: CIP-005 Electronic Security Perimeter (ESP) – Outbound-Only Connectivity
 
 The following diagram illustrates how Electronic Security Perimeters (ESPs) are preserved by ensuring
-that **no inbound routable connectivity exists from cloud services into BES Cyber Systems**.
-All communications crossing the ESP boundary are **initiated outbound** from legacy SCADA systems.
+that **no inbound routable connectivity exists from cloud services or edge devices into BES Cyber Systems**.
+All communications crossing the ESP boundary are **initiated outbound** from OT systems.
 
 ```mermaid
 flowchart LR
 
-subgraph ESP["Electronic Security Perimeter (BES Scope)"]
+subgraph ESP["BES Assets"]
     SCADA["Legacy SCADA<br/>(BES Cyber System)"]
     ICCP["ICCP / TASE.2"]
 end
 
-subgraph DMZ["OT DMZ / Controlled Interface"]
+subgraph DMZ["OT DMZ"]
     FW["Firewall / Proxy<br/>(Stateful, Monitored)"]
 end
 
-subgraph Cloud["Cloud Services (Enterprise IT / Non-BES)"]
+subgraph Cloud["IT Cloud Services"]
     CP["SaaS DER Control Plane"]
     DATA["Telemetry & Event Services"]
 end
