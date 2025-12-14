@@ -253,12 +253,13 @@ async fn main() -> Result<()> {
     };
 
     // Spawn the tick loop on a background task.
-    spawn_tick_loop(state.clone());
+    //spawn_tick_loop(state.clone());
 
     // Build the Axum router.
     let app = Router::new()
         .route("/", get(ui_home))
         .route("/assets", get(list_assets))
+        .route("/agents", get(list_agents))
         .route("/telemetry/{id}", get(latest_telemetry))
         .route("/telemetry/{id}/history", get(history_telemetry))
         .route("/telemetry", post(ingest_telemetry))
@@ -581,6 +582,8 @@ async fn init_db(pool: &PgPool) -> Result<()> {
         CREATE TABLE IF NOT EXISTS agent_sessions (
             asset_id uuid NOT NULL,
             peer text NOT NULL,
+            asset_name text,
+            site_name text,
             connected_at timestamptz NOT NULL,
             disconnected_at timestamptz
         );
@@ -589,6 +592,21 @@ async fn init_db(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await
     .context("creating agent_sessions table")?;
+
+    // Best-effort add missing columns if the table already existed.
+    // Add missing columns individually to avoid multi-statement prepared issues.
+    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS asset_name text;"#)
+        .execute(pool)
+        .await
+        .context("altering agent_sessions.asset_name")?;
+    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS site_name text;"#)
+        .execute(pool)
+        .await
+        .context("altering agent_sessions.site_name")?;
+    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS disconnected_at timestamptz;"#)
+        .execute(pool)
+        .await
+        .context("altering agent_sessions.disconnected_at")?;
     Ok(())
 }
 
@@ -789,13 +807,13 @@ async fn create_dispatch(
         Err(err) => {
             let (min_mw, max_mw, asset_name, site_name) =
                 cached_meta.unwrap_or((f64::NAN, f64::NAN, "<unknown>".into(), "<unknown>".into()));
-    let peer = {
-        let streams = state.agent_streams.read().await;
-        streams
-            .get(&req_clone.asset_id)
-            .map(|s| s.peer.clone())
-            .unwrap_or_else(|| "<not_connected>".into())
-    };
+            let peer = {
+                let streams = state.agent_streams.read().await;
+                streams
+                    .get(&req_clone.asset_id)
+                    .map(|s| s.peer.clone())
+                    .unwrap_or_else(|| "<not_connected>".into())
+            };
             tracing::error!(
                 "dispatch failed: {err} asset_id={} asset_name={} site_name={} mw_req={} min_mw={} max_mw={} peer={}",
                 req_clone.asset_id,
@@ -833,18 +851,19 @@ async fn record_agent_connect(
     db: &PgPool,
     asset_id: Uuid,
     peer: &str,
-    _asset_name: &str,
-    _site_name: &str,
+    asset_name: &str,
+    site_name: &str,
 ) -> Result<()> {
-    // For now we just store asset_id/peer/timestamp; names are logged only.
     sqlx::query(
         r#"
-        INSERT INTO agent_sessions (asset_id, peer, connected_at)
-        VALUES ($1, $2, now())
+        INSERT INTO agent_sessions (asset_id, peer, asset_name, site_name, connected_at)
+        VALUES ($1, $2, $3, $4, now())
         "#,
     )
     .bind(asset_id)
     .bind(peer)
+    .bind(asset_name)
+    .bind(site_name)
     .execute(db)
     .await
     .context("inserting agent session start")?;
@@ -864,4 +883,27 @@ async fn record_agent_disconnect(db: &PgPool, asset_id: Uuid) -> Result<()> {
     .await
     .context("updating agent session end")?;
     Ok(())
+}
+
+/// Return currently connected agents from in-memory registry.
+#[derive(Serialize)]
+struct AgentView {
+    asset_id: Uuid,
+    asset_name: String,
+    site_name: String,
+    peer: String,
+}
+
+async fn list_agents(State(state): State<AppState>) -> Response {
+    let agents = state.agent_streams.read().await;
+    let list: Vec<AgentView> = agents
+        .iter()
+        .map(|(id, s)| AgentView {
+            asset_id: *id,
+            asset_name: s.asset_name.clone(),
+            site_name: s.site_name.clone(),
+            peer: s.peer.clone(),
+        })
+        .collect();
+    Json(list).into_response()
 }

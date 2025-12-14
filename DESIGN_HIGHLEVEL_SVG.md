@@ -222,6 +222,17 @@ No synchronous, global coordination is required for safe operation.
 
 ---
 
+## Current Simulator Cut (what’s running now)
+
+- **Headend HTTP API**: `/assets`, `/telemetry/{id}`, `/telemetry/{id}/history` (returns empty array if no DB), `/dispatch` (JSON ack), `/agents` (lists connected agents with asset/site/peer). Optional Postgres stores telemetry and agent sessions.
+- **Headend gRPC (agent-initiated only)**: `AgentLink::Stream` (bidirectional). Agents connect out, send Register + Telemetry; headend pushes Setpoint. No inbound listeners required on agents.
+- **Agent sessions persisted**: `agent_sessions` table records asset_id, asset/site names, peer, connected_at/disconnected_at.
+- **Edge agent**: Ticks locally, sends telemetry every 4s, applies setpoints from the gRPC stream, reconnects with backoff if the headend is down.
+- **Launcher**: `agent_launcher` reads `assets.yaml` (override `ASSETS_PATH`), and spawns one `edge_agent` per asset. Point agents at the headend with `HEADEND_GRPC` (e.g., `127.0.0.1:50070`).
+- **Config scaling**: `assets.yaml` can be expanded to large fleets (e.g., 100 assets). Headend tick loop still runs unless disabled; for agent-only telemetry, guard or remove the local tick loop.
+
+---
+
 ## Executive Bottom Line
 
 This architecture enables organizations to:
