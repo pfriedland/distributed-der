@@ -104,9 +104,10 @@ async fn run_grpc_loop(state: AppState) -> Result<()> {
                                     let mut sim = setpoint_state.sim.write().await;
                                     sim.setpoint_mw = sp.mw;
                                     tracing::info!(
-                                        "applied setpoint from headend: mw={} asset={}",
+                                        "applied setpoint from headend: mw={} asset={} site={}",
                                         sp.mw,
-                                        setpoint_state.asset.name
+                                        setpoint_state.asset.name,
+                                        setpoint_state.asset.site_name
                                     );
                                 }
                             }

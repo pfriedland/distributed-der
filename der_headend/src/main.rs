@@ -65,6 +65,8 @@ struct AppState {
 struct AgentStream {
     tx: mpsc::Sender<HeadendToAgent>,
     peer: String,
+    asset_name: String,
+    site_name: String,
 }
 
 #[derive(Clone)]
@@ -262,7 +264,47 @@ async fn main() -> Result<()> {
         .route("/telemetry", post(ingest_telemetry))
         .route("/dispatch", post(create_dispatch))
         .with_state(state.clone())
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<_>| {
+                    let headers = req.headers();
+                    tracing::info_span!(
+                        "http_request",
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                        user_agent = ?headers.get(axum::http::header::USER_AGENT),
+                        x_request_id = ?headers.get("x-request-id"),
+                    )
+                })
+                .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                    tracing::info!(
+                        "incoming request method={} path={}",
+                        req.method(),
+                        req.uri().path()
+                    );
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
+                        span.record("status", &tracing::field::display(res.status()));
+                        tracing::info!(
+                            parent: span,
+                            status = %res.status(),
+                            latency_ms = %latency.as_millis(),
+                            "response sent"
+                        );
+                    },
+                )
+                .on_failure(
+                    |error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
+                        tracing::error!(
+                            parent: span,
+                            error = %error,
+                            latency_ms = %latency.as_millis(),
+                            "request failed"
+                        );
+                    },
+                ),
+        );
 
     // Start HTTP and gRPC servers concurrently.
     let http_addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
@@ -357,6 +399,8 @@ impl AgentLink for GrpcApi {
                                 AgentStream {
                                     tx: tx.clone(),
                                     peer: peer_ip.clone(),
+                                    asset_name: asset_name.clone(),
+                                    site_name: site_name.clone(),
                                 },
                             );
 
@@ -414,8 +458,17 @@ impl AgentLink for GrpcApi {
 
             // Clean up on disconnect.
             if let Some(id) = asset_id {
-                tracing::info!("agent disconnected asset_id={} peer={}", id, peer_ip);
-                state.agent_streams.write().await.remove(&id);
+                if let Some(agent) = state.agent_streams.write().await.remove(&id) {
+                    tracing::info!(
+                        "agent disconnected asset_id={} asset_name={} site_name={} peer={}",
+                        id,
+                        agent.asset_name,
+                        agent.site_name,
+                        peer_ip
+                    );
+                } else {
+                    tracing::info!("agent disconnected asset_id={} peer={}", id, peer_ip);
+                }
                 if let Some(db) = state.db.as_ref() {
                     if let Err(err) = record_agent_disconnect(db, id).await {
                         tracing::warn!("failed to record agent disconnect: {err}");
@@ -682,6 +735,25 @@ async fn create_dispatch(
         })
     };
 
+    // Log the incoming dispatch payload with asset/site context.
+    if let Some((min_mw, max_mw, asset_name, site_name)) = cached_meta.clone() {
+        tracing::info!(
+            "dispatch request asset_id={} asset_name={} site_name={} mw_req={} min_mw={} max_mw={}",
+            req.asset_id,
+            asset_name,
+            site_name,
+            req.mw,
+            min_mw,
+            max_mw
+        );
+    } else {
+        tracing::info!(
+            "dispatch request asset_id={} (unknown asset) mw_req={}",
+            req.asset_id,
+            req.mw
+        );
+    }
+
     let req_clone = req.clone();
     // Acquire write access to update the setpoint.
     let mut sim = state.sim.write().await;
@@ -717,13 +789,13 @@ async fn create_dispatch(
         Err(err) => {
             let (min_mw, max_mw, asset_name, site_name) =
                 cached_meta.unwrap_or((f64::NAN, f64::NAN, "<unknown>".into(), "<unknown>".into()));
-            let peer = {
-                let streams = state.agent_streams.read().await;
-                streams
-                    .get(&req_clone.asset_id)
-                    .map(|s| s.peer.clone())
-                    .unwrap_or_else(|| "<not_connected>".into())
-            };
+    let peer = {
+        let streams = state.agent_streams.read().await;
+        streams
+            .get(&req_clone.asset_id)
+            .map(|s| s.peer.clone())
+            .unwrap_or_else(|| "<not_connected>".into())
+    };
             tracing::error!(
                 "dispatch failed: {err} asset_id={} asset_name={} site_name={} mw_req={} min_mw={} max_mw={} peer={}",
                 req_clone.asset_id,
