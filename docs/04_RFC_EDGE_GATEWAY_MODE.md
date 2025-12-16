@@ -1,11 +1,20 @@
-# RFC: Edge Gateway Mode (VPP Site Controller)
+# Edge Gateway Mode (Site Controller) — Design Note
+
+## Document role
+This started as an RFC and is still useful as a **living design note** for:
+- the intended semantics of Gateway Mode,
+- the addressing/routing rules (including the `asset_id` precedence rule), and
+- the remaining V1+ hardening work.
+
+If you want to reduce doc sprawl, this can be **merged into** `01_ARCHITECTURE_CURRENT.md` later, but keeping it separate is helpful while Gateway Mode is still evolving.
 
 ## Status
 **Implemented (MVP / demo-ready)**
 
 - Gateway Mode (one `edge_agent` per site serving multiple assets) is implemented.
 - Registration uses **Pattern A** (single Register with an `assets[]` list).
-- Group dispatch via `site_id` is supported; `group_id`/`vpp_id` semantics remain future work.
+- Dispatch supports **per-asset** (`asset_id`) and **per-site** (`site_id`) targeting.
+- `group_id`/`vpp_id` semantics remain future work.
 
 ## Motivation
 The current MVP runs one `edge_agent` per DER asset. That is excellent for testing and early integration, but real deployments typically want a **single on-site gateway** that:
@@ -55,7 +64,7 @@ Edge Gateway Mode relies on a **long-lived, outbound-initiated, bidirectional** 
 2. Preserve **per-asset identity** at the headend (`asset_id` remains the control/telemetry address).
 3. Support both:
    - **Per-asset** dispatch (`asset_id` targeted)
-   - Optional **group dispatch** (e.g., `vpp_id` / `site_id`) with simple split policy
+   - **Per-site** dispatch (`site_id` targeted) with a deterministic split policy
 4. Keep behavior well-defined for reconnects and offline periods.
 5. Minimize protocol churn and maintain backwards compatibility where practical.
 
@@ -83,6 +92,7 @@ Edge Gateway Mode relies on a **long-lived, outbound-initiated, bidirectional** 
 
 ### `edge_agent`
 - `HEADEND_GRPC` (required): headend gRPC address (e.g., `127.0.0.1:50070`).
+  - Note: the headend bind address is controlled by `HEADEND_GRPC_ADDR` (server-side); the agent uses `HEADEND_GRPC` (client-side).
 - Gateway Mode:
   - `GATEWAY_SITE_ID` (required): site UUID to serve.
   - `ASSETS_PATH` (required): same YAML format as headend.
@@ -125,6 +135,13 @@ Every message that is per-asset must carry `asset_id`.
 - `group_id` / `vpp_id` is reserved for future work (not MVP).
 - If group-targeted, the gateway agent is responsible for splitting into per-asset actions.
 
+## Target resolution precedence (implemented)
+To prevent accidental fanout in Gateway Mode:
+- If a `Setpoint` contains **both** `asset_id` and `site_id`, the agent MUST treat it as a **per-asset** command.
+- Only when `asset_id` is absent/unknown should the agent treat the command as site-level and apply the split policy.
+
+This rule is intentional and should be preserved in future refactors.
+
 #### Registration
 Two compatible patterns are acceptable; pick one and standardize:
 A) **Gateway registers once** with a list of assets:
@@ -144,7 +161,7 @@ Recommendation: **Pattern A** (single register with asset list) for lower overhe
 - If the agent receives Setpoint without `asset_id`, treat it as legacy single-asset mode.
 
 ## Dispatch splitting policy (gateway responsibilities)
-If the headend targets a group (`site_id`), the gateway agent applies a **deterministic split policy**.
+If the headend targets a site (`site_id`), the gateway agent applies a **deterministic split policy** (currently implemented in the simulated `edge_agent`).
 
 **Implemented default (MVP): proportional-to-capacity**
 - Uses each asset’s `capacity_mwhr` from the YAML (`ASSETS_PATH`).
@@ -314,3 +331,8 @@ When you ask Codex to implement this, keep requests narrowly scoped. The steps b
 - Do we represent groups as `site_id` only in V1, or introduce `vpp_id` immediately?
 - Do we require per-asset heartbeats, or is gateway heartbeat sufficient for V1?
 - Do we enforce “asset claims” at registration time (recommended), and where is the source of truth (DB vs config)?
+
+## References
+- `01_ARCHITECTURE_CURRENT.md` — current system overview, purpose/requirements, and simulation notes
+- `05_TEST_PLAN_GATEWAY_MODE.md` — step-by-step verification (per-asset vs per-site dispatch)
+- `03_ROADMAP_V1.md` — V1 hardening roadmap (security, durability, UI, adapters)
