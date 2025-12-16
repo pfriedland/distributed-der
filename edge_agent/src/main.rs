@@ -5,9 +5,9 @@
 //! - Maintain an outbound gRPC stream to the headend (agent initiates; no inbound listener).
 //! - Run a 4s tick loop using `sim_core::tick_asset` to advance the battery state.
 //! - Push telemetry upstream; receive setpoints on the same stream.
-//! - Configuration comes from env vars/CLI: ASSET_ID, HEADEND_URL, plus asset params.
+//! - Configuration comes from env vars: ASSET_ID, SITE_ID, HEADEND_GRPC, plus asset params (and optional gateway mode vars).
 
-use std::{sync::Arc, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -17,6 +17,7 @@ use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use serde::Deserialize;
 
 pub mod proto {
     tonic::include_proto!("agent");
@@ -31,6 +32,7 @@ struct AppState {
     // Multi-asset runtime keyed by asset_id so we can support gateway-style agents.
     assets: Arc<RwLock<std::collections::HashMap<Uuid, AssetRuntime>>>,
     headend_grpc: String,
+    gateway_id: String,
 }
 
 #[derive(Clone)]
@@ -56,6 +58,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         headend_grpc: cfg.headend_grpc.clone(),
         assets: Arc::new(RwLock::new(assets_map)),
+        gateway_id: cfg.gateway_id.clone(),
     };
 
     // Start the tick + gRPC stream in the background.
@@ -218,6 +221,45 @@ async fn apply_setpoint(state: &AppState, sp: &Setpoint) {
 }
 
 fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid, AssetRuntime>) {
+    // Gateway Mode: load all assets for a site from YAML and serve them from one process.
+    if let (Some(site_id), Some(path)) = (cfg.gateway_site_id, cfg.assets_path.as_deref()) {
+        let assets = load_assets_for_site(path, site_id)
+            .expect("failed to load assets for gateway site (ASSETS_PATH/GATEWAY_SITE_ID)");
+        if assets.is_empty() {
+            panic!("no assets found for gateway site_id={} in {}", site_id, path);
+        }
+
+        tracing::info!(
+            "gateway mode enabled: site_id={} assets_path={} num_assets={} asset_ids={:?}",
+            site_id,
+            path,
+            assets.len(),
+            assets.iter().map(|a| a.id).collect::<Vec<_>>()
+        );
+
+        let mut map = std::collections::HashMap::new();
+        for asset in assets {
+            let asset_id = asset.id;
+            let sim_state = BessState {
+                soc_mwhr: asset.capacity_mwhr * 0.5,
+                current_mw: 0.0,
+                setpoint_mw: 0.0,
+            };
+            let runtime = AssetRuntime {
+                asset: Arc::new(asset),
+                sim: Arc::new(RwLock::new(sim_state)),
+                setpoint_timer: Arc::new(RwLock::new(None)),
+            };
+            map.insert(asset_id, runtime);
+        }
+
+        // Deterministic primary asset: smallest UUID.
+        let mut ids: Vec<Uuid> = map.keys().copied().collect();
+        ids.sort();
+        return (*ids.first().expect("empty assets map"), map);
+    }
+
+    // Legacy single-asset mode (env-driven).
     let asset = cfg.to_asset();
     let asset_id = asset.id;
     let sim_state = BessState {
@@ -239,42 +281,53 @@ async fn snapshot_assets(
     state: &AppState,
 ) -> Vec<(Uuid, Arc<Asset>, Arc<RwLock<BessState>>)> {
     let assets = state.assets.read().await;
-    assets
+    let mut rows: Vec<(Uuid, Arc<Asset>, Arc<RwLock<BessState>>)> = assets
         .iter()
         .map(|(id, rt)| (*id, rt.asset.clone(), rt.sim.clone()))
-        .collect()
+        .collect();
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
 }
 
 async fn resolve_targets(state: &AppState, sp: &Setpoint) -> Vec<AssetRuntime> {
     let assets = state.assets.read().await;
 
-    // If group_id is provided, include all assets (best-effort until groups are defined).
+    // group_id semantics are not defined in the MVP. Ignore for now to avoid surprising behavior.
     if sp.group_id.is_some() {
-        return assets.values().cloned().collect();
+        tracing::warn!(
+            "received setpoint with group_id but group routing is not implemented; ignoring group_id"
+        );
     }
 
-    // If site_id is provided, target all assets in that site.
+    // IMPORTANT: If asset_id is present and matches a known asset, treat this as a per-asset command,
+    // even if the headend also includes site_id for context. This prevents accidental fanout in
+    // Gateway Mode.
+    let asset_id_str = sp.asset_id.trim();
+    if !asset_id_str.is_empty() {
+        if let Ok(id) = Uuid::parse_str(asset_id_str) {
+            if let Some(rt) = assets.get(&id) {
+                return vec![rt.clone()];
+            }
+        }
+    }
+
+    // If site_id is provided (and asset_id was empty/unknown), target all assets in that site.
     if let Some(site_id) = sp
         .site_id
         .as_ref()
         .and_then(|s| Uuid::parse_str(s).ok())
     {
-        let site_assets: Vec<_> = assets
+        let mut site_assets: Vec<_> = assets
             .values()
             .filter(|rt| rt.asset.site_id == site_id)
             .cloned()
             .collect();
+        site_assets.sort_by_key(|rt| rt.asset.id);
         if !site_assets.is_empty() {
             return site_assets;
         }
     }
 
-    // Fallback: single asset_id.
-    if let Ok(id) = Uuid::parse_str(&sp.asset_id) {
-        if let Some(rt) = assets.get(&id) {
-            return vec![rt.clone()];
-        }
-    }
     Vec::new()
 }
 
@@ -284,7 +337,12 @@ fn compute_allocations(targets: &[AssetRuntime], mw_total: f64) -> Vec<f64> {
     }
     let cap_sum: f64 = targets.iter().map(|rt| rt.asset.capacity_mwhr).sum();
     if cap_sum <= f64::EPSILON {
-        return vec![0.0; targets.len()];
+        // Fallback: equal split if capacities are missing/zero (still clamp per asset).
+        let per = mw_total / (targets.len() as f64);
+        return targets
+            .iter()
+            .map(|rt| per.clamp(rt.asset.min_mw, rt.asset.max_mw))
+            .collect();
     }
 
     let raw: Vec<f64> = targets
@@ -344,14 +402,30 @@ fn compute_allocations(targets: &[AssetRuntime], mw_total: f64) -> Vec<f64> {
     let clamped_sum: f64 = clamped.iter().sum();
     let raw_sum: f64 = raw.iter().sum();
     tracing::info!(
-        "setpoint allocation: mw_total={} raw_sum={} clamped_sum={} residual={}",
+        "setpoint allocation: mw_total={} raw_sum={} clamped_sum={} residual={} num_assets={}",
         mw_total,
         raw_sum,
         clamped_sum,
-        residual
+        residual,
+        targets.len()
     );
-    tracing::info!("weights={:?} raw_allocations={:?}", weights, raw);
-    tracing::info!("clamped_allocations={:?}", clamped);
+
+    let rows: Vec<(Uuid, f64, f64, f64, f64, f64, f64)> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, rt)| {
+            (
+                rt.asset.id,
+                rt.asset.capacity_mwhr,
+                weights.get(i).copied().unwrap_or(0.0),
+                raw.get(i).copied().unwrap_or(0.0),
+                clamped.get(i).copied().unwrap_or(0.0),
+                rt.asset.min_mw,
+                rt.asset.max_mw,
+            )
+        })
+        .collect();
+    tracing::info!("allocation_rows=(asset_id,cap_mwhr,weight,raw,clamped,min,max) {:?}", rows);
     clamped
 }
 
@@ -401,16 +475,29 @@ async fn send_registration(
     };
 
     // Populate the repeated assets list; legacy fields use the primary asset.
-    let mut descriptors = Vec::new();
-    for rt in assets.values() {
-        descriptors.push(AssetDescriptor {
+    // NOTE: assets is a HashMap, so iteration order is not stable; sort by asset_id for determinism.
+    let mut rts: Vec<AssetRuntime> = assets.values().cloned().collect();
+    rts.sort_by_key(|rt| rt.asset.id);
+
+    let descriptors: Vec<AssetDescriptor> = rts
+        .iter()
+        .map(|rt| AssetDescriptor {
             asset_id: rt.asset.id.to_string(),
             site_id: rt.asset.site_id.to_string(),
             asset_name: rt.asset.name.clone(),
             site_name: rt.asset.site_name.clone(),
             location: rt.asset.location.clone(),
-        });
-    }
+        })
+        .collect();
+
+    tracing::info!(
+        "sending Register: primary_asset={} site_id={} gateway_id={} num_assets={} asset_ids={:?}",
+        primary.asset.id,
+        primary.asset.site_id,
+        state.gateway_id,
+        descriptors.len(),
+        rts.iter().map(|rt| rt.asset.id).collect::<Vec<_>>()
+    );
 
     tx.send(AgentToHeadend {
         msg: Some(agent_to_headend::Msg::Register(Register {
@@ -418,7 +505,7 @@ async fn send_registration(
             site_id: primary.asset.site_id.to_string(),
             asset_name: primary.asset.name.clone(),
             site_name: primary.asset.site_name.clone(),
-            gateway_id: String::new(),
+            gateway_id: state.gateway_id.clone(),
             assets: descriptors,
         })),
     })
@@ -426,9 +513,78 @@ async fn send_registration(
     .context("sending register")
 }
 
+// --- assets_test.yaml parsing (shared schema with der_headend) ---
+#[derive(Debug, Deserialize)]
+struct AssetsFile {
+    sites: Vec<YamlSite>,
+    assets: Vec<YamlAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlSite {
+    id: String,
+    name: String,
+    location: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlAsset {
+    id: String,
+    name: String,
+    site_id: String,
+    capacity_mwhr: f64,
+    max_mw: f64,
+    min_mw: f64,
+    efficiency: f64,
+    ramp_rate_mw_per_min: f64,
+}
+
+fn load_assets_for_site(path: &str, site_id: Uuid) -> Result<Vec<Asset>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read assets yaml at {}", path))?;
+    let parsed: AssetsFile = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse assets yaml at {}", path))?;
+
+    let site_id_str = site_id.to_string();
+    // Best-effort: use the site name/location from the sites table if present.
+    let (site_name, location) = parsed
+        .sites
+        .iter()
+        .find(|s| s.id == site_id_str)
+        .map(|s| (s.name.clone(), s.location.clone()))
+        .unwrap_or_else(|| ("".to_string(), "".to_string()));
+
+    let mut out = Vec::new();
+    for a in parsed.assets.into_iter().filter(|a| a.site_id == site_id_str) {
+        let asset_id: Uuid = a.id.parse().with_context(|| format!("bad asset id {}", a.id))?;
+        let site_uuid: Uuid = a
+            .site_id
+            .parse()
+            .with_context(|| format!("bad site id {}", a.site_id))?;
+
+        out.push(Asset {
+            id: asset_id,
+            site_id: site_uuid,
+            site_name: site_name.clone(),
+            name: a.name,
+            location: location.clone(),
+            capacity_mwhr: a.capacity_mwhr,
+            max_mw: a.max_mw,
+            min_mw: a.min_mw,
+            efficiency: a.efficiency,
+            ramp_rate_mw_per_min: a.ramp_rate_mw_per_min,
+        });
+    }
+
+    // Stable ordering.
+    out.sort_by_key(|a| a.id);
+    Ok(out)
+}
+
 /// Configuration for the agent (env-driven to keep the binary simple).
 #[derive(Clone, Debug)]
 struct AgentConfig {
+    // Legacy single-asset mode fields.
     asset_id: Uuid,
     site_id: Uuid,
     site_name: String,
@@ -439,22 +595,18 @@ struct AgentConfig {
     min_mw: f64,
     efficiency: f64,
     ramp_rate_mw_per_min: f64,
+
+    // Connectivity.
     headend_grpc: String,
+
+    // Gateway mode (optional).
+    assets_path: Option<String>,
+    gateway_site_id: Option<Uuid>,
+    gateway_id: String,
 }
 
 impl AgentConfig {
     fn from_env() -> Result<Self> {
-        // Beginners: env::var reads an environment variable; we parse numbers as f64.
-        let asset_id = std::env::var("ASSET_ID")?.parse()?;
-        let site_id = std::env::var("SITE_ID")?.parse()?;
-        let site_name = std::env::var("SITE_NAME")?;
-        let name = std::env::var("ASSET_NAME")?;
-        let location = std::env::var("ASSET_LOCATION")?;
-        let capacity_mwhr = std::env::var("CAPACITY_MWHR")?.parse()?;
-        let max_mw = std::env::var("MAX_MW")?.parse()?;
-        let min_mw = std::env::var("MIN_MW")?.parse()?;
-        let efficiency = std::env::var("EFFICIENCY")?.parse()?;
-        let ramp_rate_mw_per_min = std::env::var("RAMP_RATE_MW_PER_MIN")?.parse()?;
         // Allow HEADEND_GRPC to be just host:port; prepend http:// if missing.
         let raw = std::env::var("HEADEND_GRPC")?;
         let headend_grpc = if raw.starts_with("http://") || raw.starts_with("https://") {
@@ -462,6 +614,60 @@ impl AgentConfig {
         } else {
             format!("http://{}", raw)
         };
+
+        // Optional gateway mode: if GATEWAY_SITE_ID is set, load all assets for that site from ASSETS_PATH.
+        let gateway_site_id: Option<Uuid> = match std::env::var("GATEWAY_SITE_ID") {
+            Ok(v) if !v.trim().is_empty() => Some(v.parse()?),
+            _ => None,
+        };
+        let assets_path: Option<String> = match std::env::var("ASSETS_PATH") {
+            Ok(v) if !v.trim().is_empty() => Some(v),
+            _ => None,
+        };
+
+        // If gateway mode is enabled, do NOT require legacy per-asset env vars.
+        if let Some(site_uuid) = gateway_site_id {
+            if assets_path.is_none() {
+                anyhow::bail!("GATEWAY_SITE_ID is set but ASSETS_PATH is not set");
+            }
+
+            // gateway_id is optional; default to SITE_ID (here: the gateway site id) so it is stable.
+            let gateway_id = std::env::var("GATEWAY_ID").unwrap_or_else(|_| site_uuid.to_string());
+
+            // Legacy fields are placeholders in gateway mode; assets come from YAML.
+            return Ok(Self {
+                asset_id: Uuid::nil(),
+                site_id: site_uuid,
+                site_name: String::new(),
+                name: String::new(),
+                location: String::new(),
+                capacity_mwhr: 0.0,
+                max_mw: 0.0,
+                min_mw: 0.0,
+                efficiency: 1.0,
+                ramp_rate_mw_per_min: 0.0,
+                headend_grpc,
+                assets_path,
+                gateway_site_id: Some(site_uuid),
+                gateway_id,
+            });
+        }
+
+        // Legacy single-asset mode (env-driven): require per-asset vars.
+        // Beginners: env::var reads an environment variable; we parse numbers as f64.
+        let asset_id: Uuid = std::env::var("ASSET_ID")?.parse()?;
+        let site_id: Uuid = std::env::var("SITE_ID")?.parse()?;
+        let site_name = std::env::var("SITE_NAME")?;
+        let name = std::env::var("ASSET_NAME")?;
+        let location = std::env::var("ASSET_LOCATION")?;
+        let capacity_mwhr: f64 = std::env::var("CAPACITY_MWHR")?.parse()?;
+        let max_mw: f64 = std::env::var("MAX_MW")?.parse()?;
+        let min_mw: f64 = std::env::var("MIN_MW")?.parse()?;
+        let efficiency: f64 = std::env::var("EFFICIENCY")?.parse()?;
+        let ramp_rate_mw_per_min: f64 = std::env::var("RAMP_RATE_MW_PER_MIN")?.parse()?;
+
+        // gateway_id is optional; default to SITE_ID so it is stable.
+        let gateway_id = std::env::var("GATEWAY_ID").unwrap_or_else(|_| site_id.to_string());
 
         Ok(Self {
             asset_id,
@@ -475,6 +681,9 @@ impl AgentConfig {
             efficiency,
             ramp_rate_mw_per_min,
             headend_grpc,
+            assets_path,
+            gateway_site_id,
+            gateway_id,
         })
     }
 

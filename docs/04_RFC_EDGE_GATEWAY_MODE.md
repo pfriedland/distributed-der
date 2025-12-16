@@ -1,7 +1,11 @@
 # RFC: Edge Gateway Mode (VPP Site Controller)
 
 ## Status
-Draft
+**Implemented (MVP / demo-ready)**
+
+- Gateway Mode (one `edge_agent` per site serving multiple assets) is implemented.
+- Registration uses **Pattern A** (single Register with an `assets[]` list).
+- Group dispatch via `site_id` is supported; `group_id`/`vpp_id` semantics remain future work.
 
 ## Motivation
 The current MVP runs one `edge_agent` per DER asset. That is excellent for testing and early integration, but real deployments typically want a **single on-site gateway** that:
@@ -10,6 +14,21 @@ The current MVP runs one `edge_agent` per DER asset. That is excellent for testi
 - Provides a natural boundary for local safety/coordination and future “VPP-like” aggregation
 
 This RFC defines **Edge Gateway Mode**: one agent process multiplexes telemetry and control for many assets over a single gRPC stream.
+
+## Current implementation notes (Dec 2025)
+
+### What is actually running today
+- `der_headend` loads configured assets from YAML (`ASSETS_PATH`) at startup.
+- `edge_agent` supports two modes:
+  - **Single-asset mode:** one agent process represents one `asset_id`.
+  - **Gateway Mode:** one agent process represents **all assets for one `site_id`** loaded from the YAML.
+
+### Operational signature of Gateway Mode
+- `GET /agents` returns **one row per configured `asset_id`**.
+- In Gateway Mode, multiple assets typically share the **same `peer`** (same TCP connection) because they are served by a single agent process.
+
+### Dev quality-of-life
+- `der_headend` supports `RESET_DB` (truthy: `1/true/yes/on`) to truncate DB tables on startup when `DATABASE_URL` is set.
 
 ## Why gRPC for edge connectivity
 Edge Gateway Mode relies on a **long-lived, outbound-initiated, bidirectional** connection between site and headend. gRPC (HTTP/2 + protobuf) is a strong fit for this pattern:
@@ -54,6 +73,23 @@ Edge Gateway Mode relies on a **long-lived, outbound-initiated, bidirectional** 
 - **Group**: a collection of assets for “aggregate dispatch” (site, VPP, portfolio segment).
 - **Outbound-initiated connection**: the agent **initiates** the network connection to the headend (no inbound listener/port required on the site). The headend can still send commands back **over the same established stream**.
 
+## Configuration (env vars)
+
+### `der_headend`
+- `ASSETS_PATH` (required): path to the assets YAML (e.g., `der_headend/assets_test.yaml`).
+- `HEADEND_GRPC_ADDR` (recommended): gRPC bind address (e.g., `127.0.0.1:50070`).
+- `DATABASE_URL` (optional): Postgres connection string.
+- `RESET_DB` (optional): if truthy and `DATABASE_URL` is set, truncates DB tables at startup.
+
+### `edge_agent`
+- `HEADEND_GRPC` (required): headend gRPC address (e.g., `127.0.0.1:50070`).
+- Gateway Mode:
+  - `GATEWAY_SITE_ID` (required): site UUID to serve.
+  - `ASSETS_PATH` (required): same YAML format as headend.
+  - `GATEWAY_ID` (optional): logical gateway identifier; defaults to `GATEWAY_SITE_ID`.
+- Single-asset mode (legacy env vars):
+  - `ASSET_ID`, `SITE_ID`, `SITE_NAME`, `ASSET_NAME`, `ASSET_LOCATION`, `CAPACITY_MWHR`, `MAX_MW`, `MIN_MW`, `EFFICIENCY`, `RAMP_RATE_MW_PER_MIN`
+
 ## Proposed architecture
 ### Current (MVP)
 - One gRPC stream per `edge_agent`
@@ -85,7 +121,8 @@ Every message that is per-asset must carry `asset_id`.
 #### Setpoint / Dispatch Command
 - MUST include either:
   - `asset_id` (per-asset command), OR
-  - `group_id` / `site_id` (aggregate command)
+  - `site_id` (aggregate command; MVP supported)
+- `group_id` / `vpp_id` is reserved for future work (not MVP).
 - If group-targeted, the gateway agent is responsible for splitting into per-asset actions.
 
 #### Registration
@@ -98,23 +135,29 @@ B) **Gateway registers each asset** on the same stream:
 
 Recommendation: **Pattern A** (single register with asset list) for lower overhead and clear ownership.
 
+**Current behavior (implemented):**
+- `Register` includes `site_id`, `gateway_id`, a primary `asset_id` (legacy compatibility), and `assets[]` descriptors.
+- Headend registers each `assets[i].asset_id` onto the same gateway session/stream.
+
 ### Backward compatibility
 - If the headend receives Telemetry without `asset_id`, treat it as legacy single-asset mode (use the session’s associated default `asset_id`).
 - If the agent receives Setpoint without `asset_id`, treat it as legacy single-asset mode.
 
 ## Dispatch splitting policy (gateway responsibilities)
-If the headend targets a group (`site_id` / `vpp_id`), the gateway agent applies a **deterministic split policy**.
+If the headend targets a group (`site_id`), the gateway agent applies a **deterministic split policy**.
 
-V1 recommended default: **proportional-to-capacity**
-- Each asset i gets: `mw_i = mw_total * (cap_i / sum(cap))`
-- Apply clamps per asset (min/max) if available
-- Deterministic rounding rule (e.g., round to 0.001 MW, distribute remainder by largest fractional part)
+**Implemented default (MVP): proportional-to-capacity**
+- Uses each asset’s `capacity_mwhr` from the YAML (`ASSETS_PATH`).
+- For online assets in the site:
+  - `mw_i = mw_total * (cap_i / sum(cap))`
+- Clamp each `mw_i` to `[min_mw, max_mw]`.
+- Log weights + raw allocations + clamped allocations and ensure the sum matches `mw_total` within rounding tolerance.
 
-Fallback if no capacities:
-- Equal split across online assets
+**Fallback if capacities are missing/zero**
+- Equal split across online assets (still clamped).
 
-Additional V1 policy (optional):
-- Priority order: BESS first, then PV curtailment, etc. (only if customer needs it)
+**Not implemented yet**
+- `group_id`/`vpp_id` routing semantics (currently ignored; future work).
 
 ## State and lifecycle
 ### Gateway session state
@@ -144,14 +187,15 @@ Gateway agent should emit:
 - Group dispatch split results (log/trace), including final per-asset allocations
 
 Headend should expose:
-- Connected gateways and assets served
-- Dispatch success/ack rates (once ack exists)
-- Telemetry lag (now - last telemetry timestamp) per asset
+- Connected gateways and assets served (`GET /agents` shows one row per configured asset).
+- In Gateway Mode, multiple assets may share the same `peer`.
+- Session history (DB-backed when enabled) without duplicate "open" sessions.
+- Telemetry lag (now - last telemetry timestamp) per asset.
 
 ## Implementation plan (suggested sequence)
-The goal is to deliver Edge Gateway Mode in small, testable increments without breaking the existing single-asset agent.
+The goal is to deliver Edge Gateway Mode in small, testable increments without breaking the existing single-asset agent. The items marked ✅ are implemented in the current MVP.
 
-### 1) Proto updates (add addressing fields)
+### 1) Proto updates (add addressing fields) ✅
 **What you change**
 - Update `agent.proto` so that every per-asset message can be routed unambiguously.
 
@@ -167,7 +211,7 @@ The goal is to deliver Edge Gateway Mode in small, testable increments without b
 - Compile protobufs for both headend and agent.
 - Run the existing single-asset agent unchanged (or with `asset_id` defaulting) to confirm no regressions.
 
-### 2) Headend: session registry and routing by `asset_id`
+### 2) Headend: session registry and routing by `asset_id` ✅
 **What you change**
 - Extend the headend’s in-memory connection/session registry to map:
   - `site_id -> gateway_session`
@@ -181,7 +225,7 @@ The goal is to deliver Edge Gateway Mode in small, testable increments without b
 - Unit test the routing map logic.
 - Manual test: single-asset agent registers and still receives setpoints.
 
-### 3) Agent: internal model becomes a collection (multi-asset runtime)
+### 3) Agent: internal model becomes a collection (multi-asset runtime) ✅
 **What you change**
 - Refactor the agent from “one asset state” to a `HashMap<asset_id, AssetRuntime>`.
 - Each `AssetRuntime` holds the state needed to generate telemetry and apply setpoints (current mw, limits, last telemetry ts, etc.).
@@ -194,7 +238,7 @@ The goal is to deliver Edge Gateway Mode in small, testable increments without b
 - Unit test `AssetRuntime` tick/update logic.
 - Add a small in-process test that runs N assets for a few ticks and produces N telemetry messages.
 
-### 4) Telemetry mux: send per-asset telemetry over one stream
+### 4) Telemetry mux: send per-asset telemetry over one stream ✅
 **What you change**
 - Modify the agent send loop to iterate all `AssetRuntime` entries and emit telemetry tagged with `asset_id`.
 - Keep the existing cadence (e.g., every ~4s), but define whether you:
@@ -209,7 +253,7 @@ The goal is to deliver Edge Gateway Mode in small, testable increments without b
 - Headend `GET /telemetry/{asset_id}` returns distinct values per asset.
 - Verify telemetry does not “collapse” into a single asset due to routing bugs.
 
-### 5) Dispatch routing in the agent
+### 5) Dispatch routing in the agent ✅
 **What you change**
 - Update the agent receive loop to handle two cases:
   1) **Per-asset setpoint**: if `asset_id` is present, apply only to that `AssetRuntime`.
@@ -223,7 +267,7 @@ The goal is to deliver Edge Gateway Mode in small, testable increments without b
 - Issue a dispatch for one `asset_id` and confirm only that asset changes telemetry.
 - Issue a group dispatch and confirm the computed split is stable and sums to the requested total.
 
-### 6) Docs + test harness updates
+### 6) Docs + test harness updates ✅
 **What you change**
 - Update the example `assets.yaml` to show a multi-asset site (one `site_id`, multiple `asset_id`s).
 - Extend `agent_launcher` (test-only) to optionally start:
@@ -264,7 +308,7 @@ When you ask Codex to implement this, keep requests narrowly scoped. The steps b
 - One gateway agent can serve at least 10 assets with a single gRPC stream.
 - `GET /telemetry/{asset_id}` returns the correct asset’s latest telemetry.
 - `POST /dispatch` targeting an `asset_id` affects only that asset.
-- Optional: group dispatch splits deterministically and logs the split outcome.
+- `POST /dispatch` targeting a `site_id` splits deterministically (capacity-weighted) and logs the split outcome.
 
 ## Open questions
 - Do we represent groups as `site_id` only in V1, or introduce `vpp_id` immediately?

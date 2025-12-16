@@ -3,12 +3,8 @@ sites:
     name: "Gateway-Test"
     location: "Local"
 
-  - id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
-    name: "SingleAsset-Test"
-    location: "Local"
-
 assets:
-  # --- Site: Gateway-Test (2 assets, 3:1 split ratio by capacity_mwhr) ---
+  # --- Site: Gateway-Test (multiple assets; split ratio by capacity_mwhr = 120:40:40 => 3:1:1) ---
   - id: "7ba7b810-9dad-11d1-80b4-00c04fd430c8"
     name: "GT-BESS-A"
     site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -27,13 +23,11 @@ assets:
     efficiency: 0.91
     ramp_rate_mw_per_min: 1000
 
-  # --- Site: SingleAsset-Test (1 asset) ---
-  - id: "7ba7b811-9dad-11d1-80b4-00c04fd430c8"
-    name: "SA-BESS-1"
-    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
-    capacity_mwhr: 80
-    max_mw: 40
-    min_mw: -40
+  - id: "9ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "GT-BESS-C"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 40
+    max_mw: 20
+    min_mw: -20
     efficiency: 0.90
     ramp_rate_mw_per_min: 1000
-

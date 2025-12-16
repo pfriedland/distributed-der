@@ -3,6 +3,7 @@
 //! - Optionally connects to Postgres/Timescale to persist assets and telemetry.
 //! - Exposes a REST-ish API for assets, live telemetry, history, and dispatch.
 //! - Uses `sim_core` for shared models and the tick step so agents/headend stay aligned.
+//! - Env vars: ASSETS_PATH, HEADEND_GRPC_ADDR, DATABASE_URL (optional), RESET_DB (optional).
 //!
 //! Comments are written for Rust beginners and include small Python-ish snippets
 //! to show the same idea in another language.
@@ -18,19 +19,19 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sim_core::{tick_asset, Asset, BessState, Dispatch, DispatchRequest, Telemetry};
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use tokio::sync::{mpsc, RwLock};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
-use tonic::{transport::Server, Request, Response as GrpcResponse, Status};
+use sim_core::{Asset, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use tokio::sync::{RwLock, mpsc};
+use tokio_stream::{StreamExt as TokioStreamExt, wrappers::ReceiverStream};
+use tonic::{Request, Response as GrpcResponse, Status, transport::Server};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -39,8 +40,9 @@ pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
+    AgentToHeadend, HeadendToAgent, Register, Setpoint,
     agent_link_server::{AgentLink, AgentLinkServer},
-    agent_to_headend, headend_to_agent, AgentToHeadend, HeadendToAgent, Register, Setpoint,
+    agent_to_headend, headend_to_agent,
 };
 
 #[derive(Clone)]
@@ -67,6 +69,7 @@ struct AgentStream {
     site_name: String,
     #[allow(dead_code)]
     site_id: Uuid,
+    connected_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -186,8 +189,7 @@ async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
     // Python-ish: `data = yaml.safe_load(open(path))`
     let (_path, raw) = read_assets_file().await?;
     let parsed: AssetsFile = serde_yaml::from_str(&raw).context("parsing assets.yaml")?;
-    let sites: HashMap<Uuid, SiteCfg> =
-        parsed.sites.into_iter().map(|s| (s.id, s)).collect();
+    let sites: HashMap<Uuid, SiteCfg> = parsed.sites.into_iter().map(|s| (s.id, s)).collect();
 
     let mut assets = Vec::new();
     for cfg in parsed.assets {
@@ -215,7 +217,10 @@ async fn read_assets_file() -> Result<(PathBuf, String)> {
     let candidates = if let Ok(p) = std::env::var("ASSETS_PATH") {
         vec![PathBuf::from(p)]
     } else {
-        vec![PathBuf::from("assets.yaml"), PathBuf::from("../assets.yaml")]
+        vec![
+            PathBuf::from("assets.yaml"),
+            PathBuf::from("../assets.yaml"),
+        ]
     };
 
     for path in candidates {
@@ -234,7 +239,9 @@ async fn read_assets_file() -> Result<(PathBuf, String)> {
 async fn main() -> Result<()> {
     // Set up tracing so we get logs on stdout. Use `RUST_LOG=debug` for more detail.
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -292,7 +299,9 @@ async fn main() -> Result<()> {
                     );
                 })
                 .on_response(
-                    |res: &axum::http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
+                    |res: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
                         span.record("status", &tracing::field::display(res.status()));
                         tracing::info!(
                             parent: span,
@@ -303,7 +312,9 @@ async fn main() -> Result<()> {
                     },
                 )
                 .on_failure(
-                    |error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
                         tracing::error!(
                             parent: span,
                             error = %error,
@@ -335,10 +346,9 @@ async fn main() -> Result<()> {
     );
 
     // Normalize error types so try_join can return anyhow::Error.
-    tokio::try_join!(
-        async { http.await.map_err(anyhow::Error::from) },
-        async { grpc.await.map_err(anyhow::Error::from) }
-    )?;
+    tokio::try_join!(async { http.await.map_err(anyhow::Error::from) }, async {
+        grpc.await.map_err(anyhow::Error::from)
+    })?;
     Ok(())
 }
 
@@ -376,7 +386,8 @@ struct GrpcApi {
 
 #[tonic::async_trait]
 impl AgentLink for GrpcApi {
-    type StreamStream = Pin<Box<dyn futures_util::Stream<Item = Result<HeadendToAgent, Status>> + Send>>;
+    type StreamStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<HeadendToAgent, Status>> + Send>>;
 
     async fn stream(
         &self,
@@ -398,14 +409,15 @@ impl AgentLink for GrpcApi {
             while let Some(msg) = tokio_stream::StreamExt::next(&mut inbound).await {
                 match msg {
                     Ok(AgentToHeadend {
-                        msg: Some(agent_to_headend::Msg::Register(Register {
-                            asset_id: id,
-                            site_id,
-                            asset_name,
-                            site_name,
-                            assets,
-                            ..
-                        })),
+                        msg:
+                            Some(agent_to_headend::Msg::Register(Register {
+                                asset_id: id,
+                                site_id,
+                                asset_name,
+                                site_name,
+                                assets,
+                                ..
+                            })),
                     }) => {
                         asset_ids.clear();
 
@@ -423,7 +435,11 @@ impl AgentLink for GrpcApi {
                                 } else {
                                     desc.site_name.clone()
                                 };
-                                let site_uuid = Uuid::parse_str(&desc.site_id).unwrap_or_else(|_| Uuid::nil());
+                                let site_uuid = if !desc.site_id.is_empty() {
+                                    Uuid::parse_str(&desc.site_id).unwrap_or_else(|_| Uuid::nil())
+                                } else {
+                                    Uuid::parse_str(&site_id).unwrap_or_else(|_| Uuid::nil())
+                                };
 
                                 state.agent_streams.write().await.insert(
                                     uuid,
@@ -433,6 +449,7 @@ impl AgentLink for GrpcApi {
                                         asset_name: asset_name.clone(),
                                         site_name: site_name.clone(),
                                         site_id: site_uuid,
+                                        connected_at: Utc::now(),
                                     },
                                 );
                                 asset_ids.push((uuid, asset_name.clone(), site_name.clone()));
@@ -481,7 +498,8 @@ impl AgentLink for GrpcApi {
                         // Legacy single-asset registration.
                         if !registered_any {
                             if let Ok(uuid) = Uuid::parse_str(&id) {
-                                let site_uuid = Uuid::parse_str(&site_id).unwrap_or_else(|_| Uuid::nil());
+                                let site_uuid =
+                                    Uuid::parse_str(&site_id).unwrap_or_else(|_| Uuid::nil());
                                 state.agent_streams.write().await.insert(
                                     uuid,
                                     AgentStream {
@@ -490,6 +508,7 @@ impl AgentLink for GrpcApi {
                                         asset_name: asset_name.clone(),
                                         site_name: site_name.clone(),
                                         site_id: site_uuid,
+                                        connected_at: Utc::now(),
                                     },
                                 );
                                 asset_ids.push((uuid, asset_name.clone(), site_name.clone()));
@@ -503,8 +522,14 @@ impl AgentLink for GrpcApi {
                                 );
 
                                 if let Some(db) = state.db.as_ref() {
-                                    if let Err(err) =
-                                        record_agent_connect(db, uuid, &peer_ip, &asset_name, &site_name).await
+                                    if let Err(err) = record_agent_connect(
+                                        db,
+                                        uuid,
+                                        &peer_ip,
+                                        &asset_name,
+                                        &site_name,
+                                    )
+                                    .await
                                     {
                                         tracing::warn!("failed to record agent connect: {err}");
                                     }
@@ -519,7 +544,7 @@ impl AgentLink for GrpcApi {
                                                 asset_id: pending.asset_id.to_string(),
                                                 mw: pending.mw,
                                                 duration_s: pending.duration_s.map(|d| d as u64),
-                                                site_id: Some(pending.asset_id.to_string()),
+                                                site_id: Some(site_uuid.to_string()),
                                                 group_id: None,
                                             })),
                                         })
@@ -629,6 +654,36 @@ async fn handle_agent_heartbeat(state: &AppState, hb: proto::Heartbeat) -> Resul
     Ok(())
 }
 
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+async fn reset_db(pool: &PgPool) -> Result<()> {
+    // TRUNCATE is fast and keeps table definitions intact.
+    // NOTE: there are no foreign keys today, but CASCADE keeps this resilient if you add them later.
+    sqlx::query(
+        r#"
+        TRUNCATE TABLE
+            telemetry,
+            agent_sessions,
+            dispatches,
+            heartbeats,
+            assets
+        CASCADE
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("resetting database tables")?;
+    Ok(())
+}
+
 async fn maybe_connect_db() -> Result<Option<PgPool>> {
     // DATABASE_URL is optional; if not set we run in-memory only.
     let url = match std::env::var("DATABASE_URL") {
@@ -641,6 +696,12 @@ async fn maybe_connect_db() -> Result<Option<PgPool>> {
         .await
         .context("connecting to DATABASE_URL")?;
     init_db(&pool).await?;
+    // Optional: wipe all tables on startup for development convenience.
+    // Usage: RESET_DB=1 cargo run -p der_headend
+    if env_truthy("RESET_DB") {
+        tracing::warn!("RESET_DB is set; truncating database tables");
+        reset_db(&pool).await?;
+    }
     Ok(Some(pool))
 }
 
@@ -732,10 +793,12 @@ async fn init_db(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("altering agent_sessions.site_name")?;
-    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS disconnected_at timestamptz;"#)
-        .execute(pool)
-        .await
-        .context("altering agent_sessions.disconnected_at")?;
+    sqlx::query(
+        r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS disconnected_at timestamptz;"#,
+    )
+    .execute(pool)
+    .await
+    .context("altering agent_sessions.disconnected_at")?;
 
     sqlx::query(
         r#"
@@ -857,7 +920,9 @@ async fn persist_heartbeat(pool: &PgPool, asset_id: Uuid, ts: DateTime<Utc>) -> 
 
 async fn ui_home() -> Html<&'static str> {
     // Minimal placeholder UI so you can see something in the browser.
-    Html(r#"<!DOCTYPE html><html><body><h1>BESS Headend</h1><p>Use the API: /assets, /telemetry/:id, /telemetry/:id/history, /dispatch</p></body></html>"#)
+    Html(
+        r#"<!DOCTYPE html><html><body><h1>BESS Headend</h1><p>Use the API: /assets, /telemetry/:id, /telemetry/:id/history, /dispatch</p></body></html>"#,
+    )
 }
 
 async fn list_assets(State(state): State<AppState>) -> Json<Vec<Asset>> {
@@ -865,10 +930,7 @@ async fn list_assets(State(state): State<AppState>) -> Json<Vec<Asset>> {
     Json(sim.assets())
 }
 
-async fn latest_telemetry(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Response {
+async fn latest_telemetry(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
     // Prefer the latest snapshot received from an agent; fall back to sim.
     if let Some(snap) = state.latest.read().await.get(&id).cloned() {
         return Json(snap).into_response();
@@ -979,10 +1041,7 @@ async fn history_telemetry(
     }
     builder.push(" ORDER BY t.ts DESC LIMIT 100");
 
-    let rows = builder
-        .build_query_as::<TelemetryRow>()
-        .fetch_all(db)
-        .await;
+    let rows = builder.build_query_as::<TelemetryRow>().fetch_all(db).await;
 
     match rows {
         Ok(rows) => Json(rows).into_response(),
@@ -993,10 +1052,7 @@ async fn history_telemetry(
     }
 }
 
-async fn ingest_telemetry(
-    State(state): State<AppState>,
-    Json(t): Json<Telemetry>,
-) -> Response {
+async fn ingest_telemetry(State(state): State<AppState>, Json(t): Json<Telemetry>) -> Response {
     // Store the latest snapshot in-memory for fast GET /telemetry/:id responses.
     {
         let mut map = state.latest.write().await;
@@ -1039,13 +1095,15 @@ async fn create_dispatch(
         }
 
         // Fetch asset metadata for weighting/clamping.
-        let assets_meta: Vec<Asset> = {
+        let mut assets_meta: Vec<Asset> = {
             let sim = state.sim.read().await;
             online_assets
                 .iter()
                 .filter_map(|id| sim.assets.get(id).cloned())
                 .collect()
         };
+        // Deterministic order so allocation/residual behavior is stable across runs.
+        assets_meta.sort_by_key(|a| a.id);
         if assets_meta.is_empty() {
             tracing::error!("dispatch failed: metadata missing for site_id={}", site_id);
             return StatusCode::BAD_REQUEST.into_response();
@@ -1054,7 +1112,10 @@ async fn create_dispatch(
         let allocations = compute_site_allocations(&assets_meta, req.mw);
         let alloc_views: Vec<AllocationView> = allocations
             .iter()
-            .map(|(id, mw)| AllocationView { asset_id: *id, mw: *mw })
+            .map(|(id, mw)| AllocationView {
+                asset_id: *id,
+                mw: *mw,
+            })
             .collect();
         tracing::info!(
             "site dispatch split site_id={} mw_total={} allocations={:?}",
@@ -1100,7 +1161,9 @@ async fn create_dispatch(
 }
 
 async fn handle_single_dispatch(state: &AppState, req: IncomingDispatch) -> Result<Dispatch> {
-    let asset_id = req.asset_id.context("asset_id required for single dispatch")?;
+    let asset_id = req
+        .asset_id
+        .context("asset_id required for single dispatch")?;
     // Cache limits up front so we can log them without holding the write lock.
     let cached_meta = {
         let sim = state.sim.read().await;
@@ -1169,14 +1232,13 @@ async fn handle_single_dispatch(state: &AppState, req: IncomingDispatch) -> Resu
             Ok(dispatch)
         }
         Err(err) => {
-            let (min_mw, max_mw, asset_name, site_name, _site_id) =
-                cached_meta.unwrap_or((
-                    f64::NAN,
-                    f64::NAN,
-                    "<unknown>".into(),
-                    "<unknown>".into(),
-                    Uuid::nil(),
-                ));
+            let (min_mw, max_mw, asset_name, site_name, _site_id) = cached_meta.unwrap_or((
+                f64::NAN,
+                f64::NAN,
+                "<unknown>".into(),
+                "<unknown>".into(),
+                Uuid::nil(),
+            ));
             let peer = {
                 let streams = state.agent_streams.read().await;
                 streams
@@ -1253,7 +1315,8 @@ fn compute_site_allocations(assets: &[Asset], mw_total: f64) -> Vec<(Uuid, f64)>
             break;
         }
 
-        for ((val, headroom), asset) in clamped.iter_mut().zip(headrooms.iter()).zip(assets.iter()) {
+        for ((val, headroom), asset) in clamped.iter_mut().zip(headrooms.iter()).zip(assets.iter())
+        {
             if (direction_positive && *headroom <= 0.0) || (!direction_positive && *headroom >= 0.0)
             {
                 continue;
@@ -1267,13 +1330,25 @@ fn compute_site_allocations(assets: &[Asset], mw_total: f64) -> Vec<(Uuid, f64)>
     }
 
     let weights: Vec<f64> = assets.iter().map(|a| a.capacity_mwhr / cap_sum).collect();
+    let debug_rows: Vec<AllocationDebugView> = assets
+        .iter()
+        .enumerate()
+        .map(|(i, a)| AllocationDebugView {
+            asset_id: a.id,
+            capacity_mwhr: a.capacity_mwhr,
+            weight: weights.get(i).copied().unwrap_or(0.0),
+            raw_mw: raw.get(i).copied().unwrap_or(0.0),
+            clamped_mw: clamped.get(i).copied().unwrap_or(0.0),
+            min_mw: a.min_mw,
+            max_mw: a.max_mw,
+        })
+        .collect();
+
     tracing::info!(
-        "site dispatch allocation: mw_total={} weights={:?} raw={:?} clamped={:?} residual={}",
+        "site dispatch allocation: mw_total={} residual={} rows={:?}",
         mw_total,
-        weights,
-        raw,
-        clamped,
-        residual
+        residual,
+        debug_rows
     );
 
     assets
@@ -1294,17 +1369,19 @@ async fn push_setpoint_to_agent(state: &AppState, dispatch: &Dispatch) -> Result
         anyhow::bail!("agent stream not connected for asset {}", dispatch.asset_id);
     };
 
-    agent.tx.send(HeadendToAgent {
-        msg: Some(headend_to_agent::Msg::Setpoint(Setpoint {
-            asset_id: dispatch.asset_id.to_string(),
-            mw: dispatch.mw,
-            duration_s: dispatch.duration_s.map(|d| d as u64),
-            site_id: site_id.map(|s| s.to_string()),
-            group_id: None,
-        })),
-    })
-    .await
-    .context("sending setpoint over gRPC")?;
+    agent
+        .tx
+        .send(HeadendToAgent {
+            msg: Some(headend_to_agent::Msg::Setpoint(Setpoint {
+                asset_id: dispatch.asset_id.to_string(),
+                mw: dispatch.mw,
+                duration_s: dispatch.duration_s.map(|d| d as u64),
+                site_id: site_id.map(|s| s.to_string()),
+                group_id: None,
+            })),
+        })
+        .await
+        .context("sending setpoint over gRPC")?;
     Ok(())
 }
 
@@ -1315,6 +1392,20 @@ async fn record_agent_connect(
     asset_name: &str,
     site_name: &str,
 ) -> Result<()> {
+    // Defensive: if we see a duplicate Register (or a reconnect without a clean disconnect),
+    // ensure we don't accumulate multiple "open" sessions for the same asset.
+    sqlx::query(
+        r#"
+        UPDATE agent_sessions
+        SET disconnected_at = now()
+        WHERE asset_id = $1 AND disconnected_at IS NULL
+        "#,
+    )
+    .bind(asset_id)
+    .execute(db)
+    .await
+    .context("closing prior open agent session (if any)")?;
+
     sqlx::query(
         r#"
         INSERT INTO agent_sessions (asset_id, peer, asset_name, site_name, connected_at)
@@ -1351,6 +1442,7 @@ async fn record_agent_disconnect(db: &PgPool, asset_id: Uuid) -> Result<()> {
 struct AgentView {
     asset_id: Uuid,
     asset_name: String,
+    site_id: Uuid,
     site_name: String,
     peer: String,
     connected: bool,
@@ -1381,12 +1473,32 @@ struct AllocationView {
 }
 
 #[derive(Serialize, Debug)]
+struct AllocationDebugView {
+    asset_id: Uuid,
+    capacity_mwhr: f64,
+    weight: f64,
+    raw_mw: f64,
+    clamped_mw: f64,
+    min_mw: f64,
+    max_mw: f64,
+}
+
+#[derive(Serialize, Debug)]
 struct SiteDispatchResult {
     allocations: Vec<AllocationView>,
     dispatches: Vec<Dispatch>,
 }
 
 async fn list_agents(State(state): State<AppState>) -> Response {
+    // Lookup configured asset metadata so /agents can always include site_id/site_name.
+    let asset_meta: HashMap<Uuid, (Uuid, String, String)> = {
+        let sim = state.sim.read().await;
+        sim.assets
+            .iter()
+            .map(|(id, a)| (*id, (a.site_id, a.name.clone(), a.site_name.clone())))
+            .collect()
+    };
+
     // Current connections (in-memory).
     let current = state.agent_streams.read().await.clone();
 
@@ -1429,19 +1541,60 @@ async fn list_agents(State(state): State<AppState>) -> Response {
     let mut list = Vec::new();
     for (asset_id, stream) in current.iter() {
         let mut sessions = history.remove(asset_id).unwrap_or_default();
-        // Prepend current session info.
-        sessions.insert(
-            0,
-            AgentSessionView {
-                peer: stream.peer.clone(),
-                connected_at: Utc::now(),
-                disconnected_at: None,
-            },
-        );
+        // Avoid duplicate "open" sessions.
+        // If the DB already has an open session anywhere in the list, update its peer to
+        // the current peer and drop any additional open sessions.
+        let mut found_open = false;
+        for s in sessions.iter_mut() {
+            if s.disconnected_at.is_none() {
+                if !found_open {
+                    s.peer = stream.peer.clone();
+                    found_open = true;
+                } else {
+                    // Mark extras to be removed below.
+                    s.disconnected_at = Some(stream.connected_at);
+                }
+            }
+        }
+
+        if !found_open {
+            sessions.insert(
+                0,
+                AgentSessionView {
+                    peer: stream.peer.clone(),
+                    connected_at: stream.connected_at,
+                    disconnected_at: None,
+                },
+            );
+        }
+
+        // Now drop any session entries that are still "open" beyond the first.
+        // (After the loop above, extras will have been marked disconnected.)
+        let mut open_seen = false;
+        sessions.retain(|s| {
+            if s.disconnected_at.is_none() {
+                if open_seen {
+                    false
+                } else {
+                    open_seen = true;
+                    true
+                }
+            } else {
+                true
+            }
+        });
+
+        // Prefer configured metadata when available (more stable than what the agent sent).
+        let (site_id, asset_name, site_name) = asset_meta
+            .get(asset_id)
+            .cloned()
+            .unwrap_or_else(|| (stream.site_id, stream.asset_name.clone(), stream.site_name.clone()));
+
         list.push(AgentView {
             asset_id: *asset_id,
-            asset_name: stream.asset_name.clone(),
-            site_name: stream.site_name.clone(),
+            asset_name,
+            site_id,
+            site_name,
             peer: stream.peer.clone(),
             connected: true,
             sessions,
@@ -1454,11 +1607,25 @@ async fn list_agents(State(state): State<AppState>) -> Response {
             .get(&asset_id)
             .cloned()
             .unwrap_or_else(|| ("<unknown>".into(), "<unknown>".into()));
+
+        let (site_id, asset_name_cfg, site_name_cfg) = asset_meta
+            .get(&asset_id)
+            .cloned()
+            .unwrap_or_else(|| (Uuid::nil(), asset_name.clone(), site_name.clone()));
+
+        // Prefer configured names when present.
+        let asset_name = if asset_name_cfg.is_empty() { asset_name } else { asset_name_cfg };
+        let site_name = if site_name_cfg.is_empty() { site_name } else { site_name_cfg };
+
         list.push(AgentView {
             asset_id,
             asset_name,
+            site_id,
             site_name,
-            peer: sessions.first().map(|s| s.peer.clone()).unwrap_or_else(|| "<not_connected>".into()),
+            peer: sessions
+                .first()
+                .map(|s| s.peer.clone())
+                .unwrap_or_else(|| "<not_connected>".into()),
             connected: false,
             sessions,
         });
