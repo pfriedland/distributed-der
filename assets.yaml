@@ -1,0 +1,917 @@
+sites:
+  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "Jersey"
+    location: "Region-A"
+  - id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-2"
+    location: "Region-B"
+  - id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-3"
+    location: "Region-C"
+  - id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-4"
+    location: "Region-D"
+  - id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    name: "Site-5"
+    location: "Region-E"
+
+assets:
+  - id: "7ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-1"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120
+    max_mw: 60
+    min_mw: -60
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000
+
+  - id: "8ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-1B"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90
+    max_mw: 45
+    min_mw: -45
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000
+
+  - id: "7ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-2"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80
+    max_mw: 40
+    min_mw: -40
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000
+
+  - id: "7ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-3"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 150
+    max_mw: 75
+    min_mw: -75
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000
+
+  - id: "7ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-4"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110
+    max_mw: 55
+    min_mw: -55
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000
+
+  - id: "7ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    name: "BESS-5"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 51
+    max_mw: 45
+    min_mw: -45
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000
+
+  - id: "334a318f-d95a-591e-bfce-4e7da70098ee"
+    name: "BESS-007"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "e2a4a60d-beda-57eb-883e-314c3e663098"
+    name: "BESS-008"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "5c702e31-d686-5448-9d5c-454e5f266c84"
+    name: "BESS-009"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "5ea7ab95-5f38-56ea-95cd-da14a800dd76"
+    name: "BESS-010"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "b2ed9124-68fe-513c-88bc-a0b116bbad51"
+    name: "BESS-011"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "62b14ce0-e235-5520-9068-328b647f3dd1"
+    name: "BESS-012"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "1b9ad44c-ec29-50d8-a97b-5c5c5444b91d"
+    name: "BESS-013"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "70b9f6ef-9bf4-5988-92c2-5a5a3f725668"
+    name: "BESS-014"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "ca5cb175-6391-56da-b7c1-52e00b68c96c"
+    name: "BESS-015"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "e8a190d0-6e8c-5b60-9813-de2c9a0a490d"
+    name: "BESS-016"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "2475678c-884d-5617-bf7d-c2e4ee07dbea"
+    name: "BESS-017"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "1f0b54b9-a29a-5f65-8d26-74ae268c18b3"
+    name: "BESS-018"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "ab8c390a-c0c9-5788-9ce0-108313675fc8"
+    name: "BESS-019"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "dad42745-eb29-55f7-8225-231c59bc0fcc"
+    name: "BESS-020"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "60b0578e-d6d3-5056-a3df-2651e2f79b66"
+    name: "BESS-021"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "bde5e62b-64b6-5fa0-b015-f6cfa190590f"
+    name: "BESS-022"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "00bff684-4f43-5f5e-ba7f-4153f1c9b156"
+    name: "BESS-023"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d6caac32-3b0e-59e9-a5b7-08dff14c8c23"
+    name: "BESS-024"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "443858c2-ac7d-545a-a5a9-3cfd263fef6b"
+    name: "BESS-025"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "a098db79-90a8-5185-aec5-90d4daf39796"
+    name: "BESS-026"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f1a9bb3d-9f3f-5fd1-b402-983810d8b45e"
+    name: "BESS-027"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "92f9185f-0696-5e80-bb03-8ed456fe45a4"
+    name: "BESS-028"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "34bd5421-4862-59e9-8db3-30b3717c7792"
+    name: "BESS-029"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "6717a3a0-30f0-501a-949b-5b77f1bd6e43"
+    name: "BESS-030"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d7fd63e2-7cb2-52c3-a4e0-7abc8aa150b8"
+    name: "BESS-031"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "c462d006-4465-5597-a1d6-a23001bff4e4"
+    name: "BESS-032"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "fd158624-0a1f-5f38-9e63-cada38120c6b"
+    name: "BESS-033"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "3549c7ca-c4ec-5672-8cf0-d622135626e1"
+    name: "BESS-034"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "88364b80-18cb-55c5-9631-515762548bb4"
+    name: "BESS-035"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "36a8ce91-a47d-5c70-b96f-632fdbb48961"
+    name: "BESS-036"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "053a331e-f5b1-5252-a6d5-7e3be9559c44"
+    name: "BESS-037"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "c819fd76-97d6-5326-9539-3566353da13d"
+    name: "BESS-038"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "af180676-672d-568d-bcbd-f0a81814c011"
+    name: "BESS-039"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "662c0811-d2d4-5492-9a8c-190581ae2b81"
+    name: "BESS-040"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "08c474d2-493f-564a-9aa4-0eee3205126c"
+    name: "BESS-041"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "8a9d0afc-2e89-5a2b-9bee-738222e6d8fd"
+    name: "BESS-042"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d578af26-2384-5660-9d05-c007c57dbb1b"
+    name: "BESS-043"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "ce2d233e-db6d-5d19-bbd6-693ce046eb2a"
+    name: "BESS-044"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f93ff856-bbf1-5ae5-ab23-805129bab607"
+    name: "BESS-045"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "21276c92-36ae-568f-bfce-4633e5cd2887"
+    name: "BESS-046"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "c1474379-087b-5b82-ba89-66f35a17d7fd"
+    name: "BESS-047"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "eef110ad-ddd8-5249-a216-1963018be5ab"
+    name: "BESS-048"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "e08e3f29-d8ba-5567-8e25-6347d8ee191a"
+    name: "BESS-049"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "2df75164-ed56-5c50-b699-09535efd6ef6"
+    name: "BESS-050"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "fcd65525-77bd-5053-9894-454ca0826503"
+    name: "BESS-051"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "8cafd49b-cfb8-5a13-837f-20d9c74d2035"
+    name: "BESS-052"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "daf4c81d-1b87-5e3b-bdc3-076671cb4fac"
+    name: "BESS-053"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "b7365c18-20cb-58ef-9580-ad7f6bb43e55"
+    name: "BESS-054"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "6c24c4b3-d303-5ec0-b621-81097ce03b53"
+    name: "BESS-055"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d8ed4c20-c91b-5a8e-b1eb-c8fce76fcb4e"
+    name: "BESS-056"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "ecc07ff5-9051-54b5-946a-980446ad369f"
+    name: "BESS-057"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d94ee202-83f7-5a9f-94ce-41cde517f38c"
+    name: "BESS-058"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "8a1c2c5f-5167-57cd-9741-db2924abd1f2"
+    name: "BESS-059"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "fb8c8e98-db31-5bfd-af93-6c9a9f2338cf"
+    name: "BESS-060"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "01f78225-b050-59f8-986a-dc8668de7fbf"
+    name: "BESS-061"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "b0206e0a-603d-577c-901f-8f4dea72e80d"
+    name: "BESS-062"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "885dc5ac-9672-5084-b77c-01b87f876732"
+    name: "BESS-063"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f746a3c1-d889-57af-9af4-41105ad53dec"
+    name: "BESS-064"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "74138dea-108f-5c9c-b437-d3f252f77e7e"
+    name: "BESS-065"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "0a7cd7da-05d4-510d-8c93-cc5fa15379c6"
+    name: "BESS-066"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f58dd86e-98c6-549c-9ae2-4c14b63fc836"
+    name: "BESS-067"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "cc7b6ac6-398b-5580-9c50-e9ced1bf0ba9"
+    name: "BESS-068"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "a1aa9a85-5b50-5637-b0a6-0a938d628000"
+    name: "BESS-069"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "43b41cd2-841c-5183-b859-2e59d338e14f"
+    name: "BESS-070"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "106c1eff-e281-5445-8bf0-1416c44aaa93"
+    name: "BESS-071"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "438094b9-2eb5-5299-a7f6-67337323cab3"
+    name: "BESS-072"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "93e77d1f-7541-5c61-a42a-224579688729"
+    name: "BESS-073"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "9143d939-cf09-559b-8f50-f963a32a2579"
+    name: "BESS-074"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "0745a23a-cae0-5d86-bf55-a46e07583db8"
+    name: "BESS-075"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "e1de072b-b227-53d6-9034-00e3d041ab1e"
+    name: "BESS-076"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "ca6e512a-2eb8-5a4b-8b99-e4836a9e3167"
+    name: "BESS-077"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "6662354a-233d-56e3-a3c6-72012959c8fc"
+    name: "BESS-078"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "9631ed74-913f-518c-a2cf-b8b4c3de8a31"
+    name: "BESS-079"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "9ddd43ab-5b4e-58d1-ad5a-d25d36cbcfa4"
+    name: "BESS-080"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "07c0d8c2-bbd0-588d-becb-ce98393a0ff4"
+    name: "BESS-081"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "09098f8e-36b9-5eab-b81e-8261283d27a5"
+    name: "BESS-082"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "fc8ee510-56b0-54fb-ab6a-510ea1f32492"
+    name: "BESS-083"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f89b576d-9f17-5c9d-9b6c-9c9620ce7ae9"
+    name: "BESS-084"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "1d2918ae-6da6-5a73-9544-a972ab2c31c8"
+    name: "BESS-085"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "d3cd1d07-b294-5369-b951-9fa94ffa560e"
+    name: "BESS-086"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "aaffa621-71a8-5b5f-9bb5-d2bbf720a74a"
+    name: "BESS-087"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "bb8c35dc-2ced-5e4a-8ecb-2a485612a8e9"
+    name: "BESS-088"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "f6afc863-ac90-54b3-88b0-00c340d78218"
+    name: "BESS-089"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "1a9bdd0a-ec71-5ea8-9056-c590fa636f28"
+    name: "BESS-090"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "5d9025fc-28bb-5cf4-bb79-3b2cd096a711"
+    name: "BESS-091"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 85.0
+    max_mw: 42.0
+    min_mw: -42.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "4d6af0d0-c1b7-5ac4-818f-552a84bb53c2"
+    name: "BESS-092"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 90.0
+    max_mw: 44.0
+    min_mw: -44.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "4c16e0df-6fd6-5b20-9604-c86f764c08d9"
+    name: "BESS-093"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 95.0
+    max_mw: 46.0
+    min_mw: -46.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "6058d4fc-bf87-51df-81cb-2dd7ae4a6474"
+    name: "BESS-094"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100.0
+    max_mw: 48.0
+    min_mw: -48.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "3b94e23d-a1de-5391-991d-2ae4cc202f72"
+    name: "BESS-095"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 105.0
+    max_mw: 50.0
+    min_mw: -50.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "32e7558b-030b-5ae8-99fe-b76ed9c63a81"
+    name: "BESS-096"
+    site_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 110.0
+    max_mw: 52.0
+    min_mw: -52.0
+    efficiency: 0.91
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "8e7c7c3d-76c8-5a11-9de2-8b13b877df56"
+    name: "BESS-097"
+    site_id: "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 115.0
+    max_mw: 54.0
+    min_mw: -54.0
+    efficiency: 0.92
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "4c86cf67-3826-511c-b568-d5e74c049cff"
+    name: "BESS-098"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 120.0
+    max_mw: 56.0
+    min_mw: -56.0
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "1cd3940b-cfc5-5090-b917-8b352efa787d"
+    name: "BESS-099"
+    site_id: "6ba7b813-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 125.0
+    max_mw: 58.0
+    min_mw: -58.0
+    efficiency: 0.9400000000000001
+    ramp_rate_mw_per_min: 1000.0
+
+  - id: "a8facde0-3f77-5322-9b0b-e70925a7fac3"
+    name: "BESS-100"
+    site_id: "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 80.0
+    max_mw: 40.0
+    min_mw: -40.0
+    efficiency: 0.9
+    ramp_rate_mw_per_min: 1000.0

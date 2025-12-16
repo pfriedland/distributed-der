@@ -58,6 +58,7 @@ pub struct DispatchRequest {
     pub asset_id: Uuid,
     pub mw: f64, // positive = discharge, negative = charge
     pub duration_s: Option<u64>,
+    pub site_id: Option<Uuid>,
 }
 
 /// Advance a single asset state by dt_secs. Returns a telemetry snapshot.

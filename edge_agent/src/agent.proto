@@ -2,11 +2,21 @@ syntax = "proto3";
 
 package agent;
 
+message AssetDescriptor {
+  string asset_id = 1;
+  string site_id = 2;
+  string asset_name = 3;
+  string site_name = 4;
+  string location = 5;
+}
+
 message Register {
   string asset_id = 1;
   string site_id = 2;
   string asset_name = 3;
   string site_name = 4;
+  string gateway_id = 5;
+  repeated AssetDescriptor assets = 6;
 }
 
 message Telemetry {
@@ -33,6 +43,8 @@ message Setpoint {
   string asset_id = 1;
   double mw = 2;
   optional uint64 duration_s = 3;
+  optional string site_id = 4;
+  optional string group_id = 5;
 }
 
 message AgentToHeadend {
