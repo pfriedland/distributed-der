@@ -1,6 +1,6 @@
 # Distributed DER Telemetry + Dispatch Platform (MVP)
 
-This repo contains a Rust-based MVP for a distributed DER telemetry + dispatch platform (DERMS foundation) with outbound-only edge connectivity and an evolving path toward a **managed pilot service** (with a credible trajectory to multi-tenant SaaS).
+This repo contains a Rust-based MVP for a distributed DER telemetry + dispatch platform (DERMS foundation) with edge connectivity designed for secure deployment in real sites and an evolving path toward a **managed pilot service** (with a credible trajectory to multi-tenant SaaS).
 
 ## Table of contents
 
