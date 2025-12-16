@@ -12,6 +12,8 @@ This repo contains a Rust-based MVP for a distributed DER telemetry + dispatch p
 - **Gateway mode design note (RFC):** [docs/04_RFC_EDGE_GATEWAY_MODE.md](docs/04_RFC_EDGE_GATEWAY_MODE.md)
 - **Gateway mode test plan:** [docs/05_TEST_PLAN_GATEWAY_MODE.md](docs/05_TEST_PLAN_GATEWAY_MODE.md)
 - **Minimal pilot telemetry spec (Wind + PV + events):** [docs/07_TELEMETRY_MINIMAL_PILOT.md](docs/07_TELEMETRY_MINIMAL_PILOT.md)
+- **Installation (local dev + demo):** [docs/08_INSTALLATION.md](docs/08_INSTALLATION.md)
+- **Runbook (demo + ops checklist):** [docs/09_RUNBOOK.md](docs/09_RUNBOOK.md)
 
 ### Code layout
 - `der_headend/` — headend REST + gRPC services (control plane)
@@ -25,6 +27,8 @@ This repo contains a Rust-based MVP for a distributed DER telemetry + dispatch p
 - Architecture overview: [docs/01_ARCHITECTURE_CURRENT.md](docs/01_ARCHITECTURE_CURRENT.md)
 - Test plan (Gateway Mode): [docs/05_TEST_PLAN_GATEWAY_MODE.md](docs/05_TEST_PLAN_GATEWAY_MODE.md)
 - Telemetry spec (pilot): [docs/07_TELEMETRY_MINIMAL_PILOT.md](docs/07_TELEMETRY_MINIMAL_PILOT.md)
+- Installation: [docs/08_INSTALLATION.md](docs/08_INSTALLATION.md)
+- Runbook: [docs/09_RUNBOOK.md](docs/09_RUNBOOK.md)
 
 ### 1) Start the headend
 Typical environment variables:
@@ -66,3 +70,4 @@ cargo run -p edge_agent
 - The MVP supports both **per-asset** and **per-site** dispatch.
 - For Gateway Mode, preserve the precedence rule: if a command includes both `asset_id` and `site_id`, treat it as **per-asset**.
 - Telemetry durability and event/alarming support are planned V1 items; see [docs/03_ROADMAP_V1.md](docs/03_ROADMAP_V1.md) and [docs/07_TELEMETRY_MINIMAL_PILOT.md](docs/07_TELEMETRY_MINIMAL_PILOT.md).
+- For step-by-step setup and operational troubleshooting, start with [docs/08_INSTALLATION.md](docs/08_INSTALLATION.md) and [docs/09_RUNBOOK.md](docs/09_RUNBOOK.md).
