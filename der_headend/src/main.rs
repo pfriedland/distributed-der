@@ -58,6 +58,10 @@ struct AppState {
     agent_streams: Arc<RwLock<HashMap<Uuid, AgentStream>>>,
     // Pending setpoints if an agent is offline; delivered on next connect.
     pending_setpoints: Arc<RwLock<HashMap<Uuid, Dispatch>>>,
+    // Tracks SOC state to avoid spamming events.
+    soc_state: Arc<RwLock<HashMap<Uuid, SocState>>>,
+    // Last random event time per asset to throttle synthetic events.
+    last_random_event: Arc<RwLock<HashMap<Uuid, DateTime<Utc>>>>,
 }
 
 /// Connection info for a live agent stream.
@@ -125,6 +129,17 @@ impl Simulator {
             .assets
             .get(&req.asset_id)
             .context("asset not found for dispatch")?;
+        // Reject dispatches that push beyond SOC bounds.
+        if let Some(state) = self.state.get(&req.asset_id) {
+            let (min_soc, max_soc) = soc_bounds(asset);
+            let eps = 1e-6;
+            if req.mw > 0.0 && state.soc_mwhr <= min_soc + eps {
+                anyhow::bail!("dispatch rejected: at min SOC");
+            }
+            if req.mw < 0.0 && state.soc_mwhr >= max_soc - eps {
+                anyhow::bail!("dispatch rejected: at max SOC");
+            }
+        }
         // Basic limit check: clamp MW to min/max.
         if req.mw > asset.max_mw || req.mw < asset.min_mw {
             anyhow::bail!("mw out of bounds for asset");
@@ -169,6 +184,19 @@ fn initial_soc_mwhr(asset: &Asset) -> f64 {
         cap * (min_pct + max_pct) / 200.0
     } else {
         cap * 0.5
+    }
+}
+
+fn soc_bounds(asset: &Asset) -> (f64, f64) {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    let min_mwhr = cap * min_pct / 100.0;
+    let max_mwhr = cap * max_pct / 100.0;
+    if min_mwhr <= max_mwhr {
+        (min_mwhr, max_mwhr)
+    } else {
+        (0.0, cap)
     }
 }
 
@@ -347,6 +375,8 @@ async fn main() -> Result<()> {
         latest: Arc::new(RwLock::new(HashMap::new())),
         agent_streams: Arc::new(RwLock::new(HashMap::new())),
         pending_setpoints: Arc::new(RwLock::new(HashMap::new())),
+        soc_state: Arc::new(RwLock::new(HashMap::new())),
+        last_random_event: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Spawn the tick loop on a background task.
@@ -362,6 +392,8 @@ async fn main() -> Result<()> {
         .route("/telemetry", post(ingest_telemetry))
         .route("/dispatch", post(create_dispatch))
         .route("/dispatch/history", get(list_dispatch_history))
+        .route("/events", post(create_event))
+        .route("/events/{id}/history", get(list_event_history))
         .route("/heartbeat/{id}", get(latest_heartbeat))
         .route("/heartbeat/{id}/history", get(history_heartbeats))
         .with_state(state.clone())
@@ -731,7 +763,9 @@ async fn handle_agent_telemetry(state: &AppState, t: proto::Telemetry) -> Result
     }
 
     if let Some(db) = state.db.as_ref() {
-        persist_telemetry(db, &[snap]).await?;
+        persist_telemetry(db, &[snap.clone()]).await?;
+        maybe_emit_soc_event(state, db, &snap).await?;
+        maybe_emit_random_event(state, db, &snap).await?;
     }
 
     Ok(())
@@ -786,6 +820,95 @@ fn env_truthy(name: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocState {
+    BelowMin,
+    InRange,
+    AboveMax,
+}
+
+async fn maybe_emit_soc_event(state: &AppState, db: &PgPool, snap: &Telemetry) -> Result<()> {
+    let asset = {
+        let sim = state.sim.read().await;
+        sim.assets.get(&snap.asset_id).cloned()
+    };
+    let Some(asset) = asset else {
+        return Ok(());
+    };
+    let (min_soc, max_soc) = soc_bounds(&asset);
+    let eps = 1e-6;
+    let next_state = if snap.soc_mwhr <= min_soc + eps {
+        SocState::BelowMin
+    } else if snap.soc_mwhr >= max_soc - eps {
+        SocState::AboveMax
+    } else {
+        SocState::InRange
+    };
+
+    let mut states = state.soc_state.write().await;
+    let prev = states.insert(snap.asset_id, next_state);
+    if prev == Some(next_state) {
+        return Ok(());
+    }
+
+    let (event_type, message) = match next_state {
+        SocState::BelowMin => ("MIN_SOC_REACHED", "Min SOC reached"),
+        SocState::AboveMax => ("MAX_SOC_REACHED", "Max SOC reached"),
+        SocState::InRange => return Ok(()),
+    };
+
+    let event = BessEvent {
+        id: Uuid::new_v4(),
+        asset_id: snap.asset_id,
+        site_id: asset.site_id,
+        ts: snap.timestamp,
+        event_type: event_type.to_string(),
+        severity: "warning".to_string(),
+        message: message.to_string(),
+    };
+    persist_event(db, &event).await?;
+    Ok(())
+}
+
+async fn maybe_emit_random_event(state: &AppState, db: &PgPool, snap: &Telemetry) -> Result<()> {
+    const PROB: f64 = 0.005; // 0.5% chance per telemetry tick
+    const MIN_INTERVAL_SECS: i64 = 120;
+
+    let roll: f64 = rand::random();
+    if roll > PROB {
+        return Ok(());
+    }
+
+    let mut last = state.last_random_event.write().await;
+    if let Some(prev) = last.get(&snap.asset_id) {
+        if (snap.timestamp - *prev).num_seconds() < MIN_INTERVAL_SECS {
+            return Ok(());
+        }
+    }
+    last.insert(snap.asset_id, snap.timestamp);
+
+    let templates = [
+        ("RACK_FAULT", "warning", "Rack 2/4 Trouble"),
+        ("HVAC_FAILED", "alarm", "HVAC Failed"),
+        ("INVERTER_FAULT", "alarm", "Inverter Fault Detected"),
+        ("COMMS_DEGRADED", "warning", "Site comms degraded"),
+    ];
+    let idx = rand::random::<usize>() % templates.len();
+    let (event_type, severity, message) = templates[idx];
+
+    let event = BessEvent {
+        id: Uuid::new_v4(),
+        asset_id: snap.asset_id,
+        site_id: snap.site_id,
+        ts: snap.timestamp,
+        event_type: event_type.to_string(),
+        severity: severity.to_string(),
+        message: message.to_string(),
+    };
+    persist_event(db, &event).await?;
+    Ok(())
+}
+
 async fn reset_db(pool: &PgPool) -> Result<()> {
     // TRUNCATE is fast and keeps table definitions intact.
     // NOTE: there are no foreign keys today, but CASCADE keeps this resilient if you add them later.
@@ -796,6 +919,7 @@ async fn reset_db(pool: &PgPool) -> Result<()> {
             agent_sessions,
             dispatches,
             heartbeats,
+            events,
             assets
         CASCADE
         "#,
@@ -950,6 +1074,23 @@ async fn init_db(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await
     .context("creating heartbeats table")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS events (
+            id uuid PRIMARY KEY,
+            asset_id uuid NOT NULL,
+            site_id uuid NOT NULL,
+            ts timestamptz NOT NULL,
+            event_type text NOT NULL,
+            severity text NOT NULL,
+            message text NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("creating events table")?;
     Ok(())
 }
 
@@ -1038,6 +1179,26 @@ async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
     .execute(pool)
     .await
     .context("inserting dispatch row")?;
+    Ok(())
+}
+
+async fn persist_event(pool: &PgPool, event: &BessEvent) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO events (id, asset_id, site_id, ts, event_type, severity, message)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(event.id)
+    .bind(event.asset_id)
+    .bind(event.site_id)
+    .bind(event.ts)
+    .bind(&event.event_type)
+    .bind(&event.severity)
+    .bind(&event.message)
+    .execute(pool)
+    .await
+    .context("inserting event")?;
     Ok(())
 }
 
@@ -1137,7 +1298,8 @@ async fn ui_home() -> Html<&'static str> {
           <table>
             <thead>
               <tr>
-                <th>asset_id</th>
+                <th>site_name</th>
+                <th>asset_name</th>
                 <th>mw_raw</th>
                 <th>mw_final</th>
                 <th>clamped</th>
@@ -1180,10 +1342,11 @@ async fn ui_home() -> Html<&'static str> {
         <table>
           <thead>
             <tr>
-              <th>site_id</th>
               <th>site_name</th>
-              <th>asset_id</th>
               <th>asset_name</th>
+              <th>current_mw</th>
+              <th>soc_pct</th>
+              <th>setpoint_mw</th>
               <th>cap_mwhr</th>
               <th>min_mw</th>
               <th>max_mw</th>
@@ -1196,28 +1359,52 @@ async fn ui_home() -> Html<&'static str> {
       </div>
     </div>
 
-    <div class="card" style="grid-column: 1 / span 2;">
-      <div class="row" style="justify-content: space-between;">
-        <h2 style="margin:0;">Agents</h2>
-        <div class="row">
-          <button id="refresh_agents" class="small">Refresh</button>
-          <span id="agents_meta" class="small muted"></span>
+    <div style="grid-column: 1 / span 2; display:grid; grid-template-columns: 1fr 2fr; gap: 12px;">
+      <div class="card">
+        <div class="row" style="justify-content: space-between;">
+          <h2 style="margin:0;">Agents</h2>
+          <div class="row">
+            <button id="refresh_agents" class="small">Refresh</button>
+            <span id="agents_meta" class="small muted"></span>
+          </div>
+        </div>
+        <div style="max-height: 320px; overflow:auto; margin-top: 8px;">
+          <table>
+            <thead>
+              <tr>
+                <th>connected_at</th>
+                <th>connected</th>
+                <th>site_name</th>
+                <th>asset_name</th>
+                <th>peer</th>
+                <th>sessions</th>
+              </tr>
+            </thead>
+            <tbody id="agents_tbody"></tbody>
+          </table>
         </div>
       </div>
-      <div style="max-height: 320px; overflow:auto; margin-top: 8px;">
-        <table>
-          <thead>
-            <tr>
-              <th>connected_at</th>
-              <th>connected</th>
-              <th>site_name</th>
-              <th>asset_name</th>
-              <th>peer</th>
-              <th>sessions</th>
-            </tr>
-          </thead>
-          <tbody id="agents_tbody"></tbody>
-        </table>
+
+      <div class="card">
+        <div class="row" style="justify-content: space-between;">
+          <h2 style="margin:0;">Events history (selected asset)</h2>
+          <div class="row">
+            <span class="small muted">Auto-refreshes with selected asset.</span>
+          </div>
+        </div>
+        <div style="max-height: 360px; overflow:auto; margin-top: 8px;">
+          <table>
+            <thead>
+              <tr>
+                <th>timestamp</th>
+                <th>site_name</th>
+                <th>asset_name</th>
+                <th>event_info</th>
+              </tr>
+            </thead>
+            <tbody id="events_tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -1301,6 +1488,7 @@ async fn ui_home() -> Html<&'static str> {
 
   let ASSETS = [];
   let SITES = new Map(); // site_id -> site_name
+  let TELEMETRY = new Map();
   let selectedAssetId = null;
 
   function pretty(obj) {
@@ -1394,11 +1582,13 @@ async fn ui_home() -> Html<&'static str> {
     for (const a of list) {
       const tr = document.createElement('tr');
       tr.onclick = () => selectAsset(a.id, a.name);
+      const t = TELEMETRY.get(a.id);
       tr.innerHTML = `
-        <td><code>${escapeHtml(a.site_id)}</code></td>
         <td>${escapeHtml(a.site_name)}</td>
-        <td><code>${escapeHtml(a.id)}</code></td>
         <td>${escapeHtml(a.name)}</td>
+        <td>${fmt(t ? t.current_mw : null)}</td>
+        <td>${fmt(t ? t.soc_pct : null)}</td>
+        <td>${fmt(t ? t.setpoint_mw : null)}</td>
         <td>${fmt(a.capacity_mwhr)}</td>
         <td>${fmt(a.min_mw)}</td>
         <td>${fmt(a.max_mw)}</td>
@@ -1478,8 +1668,10 @@ async fn ui_home() -> Html<&'static str> {
     for (const a of list) {
       const tr = document.createElement('tr');
       if (a.clamped) tr.classList.add('clamped-row');
+      const asset = ASSETS.find(x => x.id === a.asset_id);
       tr.innerHTML = `
-        <td><code>${escapeHtml(a.asset_id)}</code></td>
+        <td>${escapeHtml(asset ? asset.site_name : '')}</td>
+        <td>${escapeHtml(asset ? asset.name : '')}</td>
         <td>${fmt(a.mw_raw)}</td>
         <td>${fmt(a.mw)}</td>
         <td>${a.clamped ? 'yes' : 'no'}</td>
@@ -1510,6 +1702,23 @@ async fn ui_home() -> Html<&'static str> {
       tbody.appendChild(tr);
     }
     $('hist_meta').textContent = `${list.length} rows`;
+  }
+
+  function renderEvents(rows) {
+    const tbody = $('events_tbody');
+    tbody.innerHTML = '';
+    const list = Array.isArray(rows) ? rows : [];
+    for (const r of list) {
+      const info = `${r.event_type || ''}${r.severity ? ` (${r.severity})` : ''}${r.message ? ` — ${r.message}` : ''}`;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${escapeHtml(formatTs(r.ts))}</code></td>
+        <td>${escapeHtml(r.site_name || '')}</td>
+        <td>${escapeHtml(r.asset_name || '')}</td>
+        <td>${escapeHtml(info)}</td>
+      `;
+      tbody.appendChild(tr);
+    }
   }
 
   async function loadTelemetryHistory() {
@@ -1588,6 +1797,21 @@ async fn ui_home() -> Html<&'static str> {
     renderAssetsTable();
   }
 
+  async function refreshAssetTelemetry() {
+    const list = Array.isArray(ASSETS) ? ASSETS : [];
+    const requests = list.map(a =>
+      fetchJson(`/telemetry/${a.id}`)
+        .then(t => ({ id: a.id, t }))
+        .catch(() => null)
+    );
+    const results = await Promise.all(requests);
+    TELEMETRY = new Map();
+    for (const item of results) {
+      if (item && item.t) TELEMETRY.set(item.id, item.t);
+    }
+    renderAssetsTable();
+  }
+
   async function loadAgents() {
     const agents = await fetchJson('/agents');
     renderAgentsTable(Array.isArray(agents) ? agents : []);
@@ -1619,6 +1843,12 @@ async fn ui_home() -> Html<&'static str> {
       $('heartbeat_json').textContent = pretty(hb);
     } catch (e) {
       $('heartbeat_json').textContent = pretty({ error: String(e) });
+    }
+    try {
+      const events = await fetchJson(`/events/${selectedAssetId}/history`);
+      renderEvents(events);
+    } catch (e) {
+      renderEvents([]);
     }
     await loadTelemetryHistory();
   }
@@ -1705,11 +1935,13 @@ async fn ui_home() -> Html<&'static str> {
     wireUi();
     try {
       await loadAssets();
+      await refreshAssetTelemetry();
       await loadAgents();
       await loadDispatchHistory();
       if (ASSETS.length) selectAsset(ASSETS[0].id, ASSETS[0].name);
       setInterval(() => loadAgents().catch(() => {}), 4000);
       setInterval(() => loadDispatchHistory().catch(() => {}), 4000);
+      setInterval(() => refreshAssetTelemetry().catch(() => {}), 4000);
     } catch (e) {
       $('dispatch_resp').textContent = pretty({ error: String(e) });
       setStatus(false, 'UI boot failed');
@@ -2486,6 +2718,38 @@ struct DispatchRow {
     acked_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+struct EventRow {
+    id: Uuid,
+    asset_id: Uuid,
+    asset_name: String,
+    site_id: Uuid,
+    site_name: String,
+    ts: DateTime<Utc>,
+    event_type: String,
+    severity: String,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EventRequest {
+    asset_id: Uuid,
+    event_type: String,
+    severity: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct BessEvent {
+    id: Uuid,
+    asset_id: Uuid,
+    site_id: Uuid,
+    ts: DateTime<Utc>,
+    event_type: String,
+    severity: String,
+    message: String,
+}
+
 /// Return recent dispatch records (DB-backed). Empty array if no DB configured.
 async fn list_dispatch_history(State(state): State<AppState>) -> Response {
     let Some(db) = state.db.as_ref() else {
@@ -2519,6 +2783,70 @@ async fn list_dispatch_history(State(state): State<AppState>) -> Response {
         Ok(list) => Json(list).into_response(),
         Err(err) => {
             tracing::error!("dispatch history query failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn create_event(State(state): State<AppState>, Json(req): Json<EventRequest>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let asset = {
+        let sim = state.sim.read().await;
+        sim.assets.get(&req.asset_id).cloned()
+    };
+    let Some(asset) = asset else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let event = BessEvent {
+        id: Uuid::new_v4(),
+        asset_id: req.asset_id,
+        site_id: asset.site_id,
+        ts: Utc::now(),
+        event_type: req.event_type,
+        severity: req.severity.unwrap_or_else(|| "warning".into()),
+        message: req.message.unwrap_or_default(),
+    };
+    if let Err(err) = persist_event(db, &event).await {
+        tracing::warn!("failed to persist event: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Json(event).into_response()
+}
+
+async fn list_event_history(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return Json(Vec::<EventRow>::new()).into_response();
+    };
+    let rows = sqlx::query_as::<_, EventRow>(
+        r#"
+        SELECT
+            e.id,
+            e.asset_id,
+            COALESCE(a.name, '<unknown>') AS asset_name,
+            e.site_id,
+            COALESCE(a.site_name, '<unknown>') AS site_name,
+            e.ts,
+            e.event_type,
+            e.severity,
+            e.message
+        FROM events e
+        LEFT JOIN assets a ON e.asset_id = a.id
+        WHERE e.asset_id = $1
+        ORDER BY e.ts DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await;
+
+    match rows {
+        Ok(list) => Json(list).into_response(),
+        Err(err) => {
+            tracing::error!("event history query failed: {err}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

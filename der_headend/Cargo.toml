@@ -23,6 +23,7 @@ tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 futures-util = "0.3"
 sim_core = { path = "../sim_core" }
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12"
