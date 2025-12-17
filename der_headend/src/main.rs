@@ -919,9 +919,519 @@ async fn persist_heartbeat(pool: &PgPool, asset_id: Uuid, ts: DateTime<Utc>) -> 
 // --- HTTP handlers ---
 
 async fn ui_home() -> Html<&'static str> {
-    // Minimal placeholder UI so you can see something in the browser.
+    // Lightweight demo UI: single HTML page with inline JS calling the existing REST endpoints.
+    // No frontend toolchain required.
     Html(
-        r#"<!DOCTYPE html><html><body><h1>BESS Headend</h1><p>Use the API: /assets, /telemetry/:id, /telemetry/:id/history, /dispatch</p></body></html>"#,
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DER Headend — MVP UI</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 16px; }
+    h1 { margin: 0 0 6px 0; }
+    .sub { color: #555; margin: 0 0 16px 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    .card h2 { font-size: 16px; margin: 0 0 10px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: auto; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; vertical-align: top; }
+    th { color: #444; font-weight: 600; background: #fafafa; position: sticky; top: 0; }
+    tr:hover { background: #fcfcff; cursor: pointer; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, select, button { font-size: 13px; padding: 6px 8px; }
+    button { cursor: pointer; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .ok { background: #e8fff0; border: 1px solid #b9f1cc; }
+    .bad { background: #fff0f0; border: 1px solid #f1b9b9; }
+    pre { margin: 0; font-size: 12px; overflow: auto; max-height: 260px; background: #0b1020; color: #e9eefc; padding: 10px; border-radius: 10px; }
+    .muted { color: #666; }
+    .links a { margin-right: 10px; }
+    .small { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>DER Headend — MVP UI</h1>
+  <p class="sub">Local dashboard for assets, agents, telemetry, and dispatch. (API-first; this page uses the same endpoints you can call with <code>curl</code>.)</p>
+
+  <div class="links small">
+    <span class="muted">Quick links:</span>
+    <a href="/assets">/assets</a>
+    <a href="/agents">/agents</a>
+    <a href="/dispatch/history">/dispatch/history</a>
+  </div>
+
+  <div class="grid" style="margin-top: 12px;">
+    <div class="card">
+      <h2>Dispatch</h2>
+      <div class="row" style="margin-bottom: 8px;">
+        <label><input type="radio" name="dispatch_mode" value="asset" checked /> Per-asset</label>
+        <label><input type="radio" name="dispatch_mode" value="site" /> Per-site</label>
+        <span class="muted">BESS convention: <b>+MW discharge</b>, <b>-MW charge</b></span>
+      </div>
+
+      <div class="row" style="margin-bottom: 8px;">
+        <select id="asset_select" style="min-width: 380px;"></select>
+        <select id="site_select" style="min-width: 380px; display:none;"></select>
+      </div>
+
+      <div class="row" style="margin-bottom: 8px;">
+        <label>MW <input id="mw" type="number" step="0.1" value="5" style="width: 120px;" /></label>
+        <label>Duration (s) <input id="duration_s" type="number" step="1" placeholder="optional" style="width: 140px;" /></label>
+        <button id="dispatch_btn">Send dispatch</button>
+        <span id="dispatch_status" class="pill ok" style="display:none;"></span>
+      </div>
+
+      <div class="small muted">Tip: in Gateway Mode, per-site dispatch will be split across online assets at that site (capacity-weighted + clamped).</div>
+
+      <div style="margin-top: 10px;">
+        <div class="row" style="justify-content: space-between;">
+          <div class="small muted">Last response</div>
+          <button id="clear_resp" class="small">Clear</button>
+        </div>
+        <pre id="dispatch_resp">{}</pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Selected asset: telemetry + heartbeat</h2>
+      <div class="small muted" style="margin-bottom: 8px;">Click an asset row below to load its latest telemetry and heartbeat.</div>
+      <div class="row" style="margin-bottom: 8px;">
+        <span class="small muted">Asset:</span> <span id="selected_asset" class="small">(none)</span>
+        <button id="refresh_selected" class="small">Refresh</button>
+      </div>
+      <div class="row" style="gap: 12px;">
+        <div style="flex: 1; min-width: 320px;">
+          <div class="small muted" style="margin-bottom: 6px;">Telemetry (latest)</div>
+          <pre id="telemetry_json">{}</pre>
+        </div>
+        <div style="flex: 1; min-width: 320px;">
+          <div class="small muted" style="margin-bottom: 6px;">Heartbeat (latest)</div>
+          <pre id="heartbeat_json">{}</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / span 2;">
+      <div class="row" style="justify-content: space-between;">
+        <h2 style="margin:0;">Assets</h2>
+        <div class="row">
+          <button id="refresh_assets" class="small">Refresh</button>
+          <span id="assets_meta" class="small muted"></span>
+        </div>
+      </div>
+      <div style="max-height: 320px; overflow:auto; margin-top: 8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>asset_name</th>
+              <th>asset_id</th>
+              <th>site_name</th>
+              <th>site_id</th>
+              <th>cap_mwhr</th>
+              <th>min_mw</th>
+              <th>max_mw</th>
+            </tr>
+          </thead>
+          <tbody id="assets_tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / span 2;">
+      <div class="row" style="justify-content: space-between;">
+        <h2 style="margin:0;">Agents</h2>
+        <div class="row">
+          <button id="refresh_agents" class="small">Refresh</button>
+          <span id="agents_meta" class="small muted"></span>
+        </div>
+      </div>
+      <div style="max-height: 320px; overflow:auto; margin-top: 8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>connected</th>
+              <th>asset_name</th>
+              <th>asset_id</th>
+              <th>site_name</th>
+              <th>site_id</th>
+              <th>peer</th>
+              <th>sessions</th>
+            </tr>
+          </thead>
+          <tbody id="agents_tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / span 2;">
+      <div class="row" style="justify-content: space-between;">
+        <h2 style="margin:0;">Recent dispatch history</h2>
+        <div class="row">
+          <button id="refresh_dispatch_hist" class="small">Refresh</button>
+          <span id="dispatch_hist_meta" class="small muted"></span>
+        </div>
+      </div>
+      <div class="small muted" style="margin-top: 6px;">Note: returns an empty array if no DB is configured.</div>
+      <div style="max-height: 280px; overflow:auto; margin-top: 8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>submitted_at</th>
+              <th>asset_id</th>
+              <th>mw</th>
+              <th>duration_s</th>
+              <th>status</th>
+              <th>reason</th>
+            </tr>
+          </thead>
+          <tbody id="dispatch_hist_tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / span 2;">
+      <div class="row" style="justify-content: space-between;">
+        <h2 style="margin:0;">Telemetry history (selected asset)</h2>
+        <div class="row">
+          <button id="load_hist" class="small">Load history</button>
+          <span id="hist_meta" class="small muted"></span>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 6px;">
+        <label class="small">start RFC3339 <input id="hist_start" type="text" placeholder="optional" style="width: 300px;" /></label>
+        <label class="small">end RFC3339 <input id="hist_end" type="text" placeholder="optional" style="width: 300px;" /></label>
+        <span class="small muted">Note: returns an empty list if no DB is configured.</span>
+      </div>
+
+      <div style="max-height: 360px; overflow:auto; margin-top: 8px;">
+        <table style="min-width: 1800px;">
+          <thead>
+            <tr>
+              <th>ts</th>
+              <th>asset_name</th>
+              <th>site_name</th>
+              <th>soc_pct</th>
+              <th>soc_mwhr</th>
+              <th>capacity_mwhr</th>
+              <th>current_mw</th>
+              <th>setpoint_mw</th>
+              <th>min_mw</th>
+              <th>max_mw</th>
+              <th>status</th>
+            </tr>
+          </thead>
+          <tbody id="telemetry_hist_tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  let ASSETS = [];
+  let SITES = new Map(); // site_id -> site_name
+  let selectedAssetId = null;
+
+  function pretty(obj) {
+    try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+  }
+
+  async function fetchJson(path, opts) {
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (!res.ok) {
+      const msg = typeof data === 'string' ? data : (data && data.message) ? data.message : res.statusText;
+      throw new Error(`${res.status} ${msg}`);
+    }
+    return data;
+  }
+
+  function setStatus(ok, msg) {
+    const el = $('dispatch_status');
+    el.style.display = 'inline-block';
+    el.className = `pill ${ok ? 'ok' : 'bad'}`;
+    el.textContent = msg;
+    setTimeout(() => { el.style.display = 'none'; }, 2500);
+  }
+
+  function dispatchMode() {
+    return document.querySelector('input[name="dispatch_mode"]:checked').value;
+  }
+
+  function rebuildSelectors() {
+    const assetSel = $('asset_select');
+    assetSel.innerHTML = '';
+    for (const a of ASSETS) {
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = `${a.name}  (${a.id})  — ${a.site_name}`;
+      assetSel.appendChild(opt);
+    }
+
+    const siteSel = $('site_select');
+    siteSel.innerHTML = '';
+    const sites = Array.from(SITES.entries()).sort((a,b) => a[1].localeCompare(b[1]));
+    for (const [siteId, siteName] of sites) {
+      const opt = document.createElement('option');
+      opt.value = siteId;
+      opt.textContent = `${siteName}  (${siteId})`;
+      siteSel.appendChild(opt);
+    }
+  }
+
+  function renderAssetsTable() {
+    const tbody = $('assets_tbody');
+    tbody.innerHTML = '';
+    for (const a of ASSETS) {
+      const tr = document.createElement('tr');
+      tr.onclick = () => selectAsset(a.id, a.name);
+      tr.innerHTML = `
+        <td>${escapeHtml(a.name)}</td>
+        <td><code>${escapeHtml(a.id)}</code></td>
+        <td>${escapeHtml(a.site_name)}</td>
+        <td><code>${escapeHtml(a.site_id)}</code></td>
+        <td>${fmt(a.capacity_mwhr)}</td>
+        <td>${fmt(a.min_mw)}</td>
+        <td>${fmt(a.max_mw)}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    $('assets_meta').textContent = `${ASSETS.length} assets`;
+  }
+
+  function renderAgentsTable(agents) {
+    const tbody = $('agents_tbody');
+    tbody.innerHTML = '';
+    for (const a of agents) {
+      const tr = document.createElement('tr');
+      const ok = a.connected ? 'ok' : 'bad';
+      const connText = a.connected ? 'connected' : 'disconnected';
+      const sessionCount = Array.isArray(a.sessions) ? a.sessions.length : 0;
+      tr.innerHTML = `
+        <td><span class="pill ${ok}">${connText}</span></td>
+        <td>${escapeHtml(a.asset_name || '')}</td>
+        <td><code>${escapeHtml(a.asset_id)}</code></td>
+        <td>${escapeHtml(a.site_name || '')}</td>
+        <td><code>${escapeHtml(a.site_id)}</code></td>
+        <td><code>${escapeHtml(a.peer || '')}</code></td>
+        <td>${sessionCount}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    $('agents_meta').textContent = `${agents.length} rows`;
+  }
+
+  function renderDispatchHistory(rows) {
+    const tbody = $('dispatch_hist_tbody');
+    tbody.innerHTML = '';
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${escapeHtml(r.submitted_at)}</code></td>
+        <td><code>${escapeHtml(r.asset_id)}</code></td>
+        <td>${fmt(r.mw)}</td>
+        <td>${r.duration_s == null ? '' : escapeHtml(String(r.duration_s))}</td>
+        <td>${escapeHtml(r.status || '')}</td>
+        <td>${escapeHtml(r.reason || '')}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    $('dispatch_hist_meta').textContent = `${rows.length} rows`;
+  }
+
+  function renderTelemetryHistory(rows) {
+    const tbody = $('telemetry_hist_tbody');
+    tbody.innerHTML = '';
+    const list = Array.isArray(rows) ? rows : [];
+    for (const r of list) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${escapeHtml(r.ts)}</code></td>
+        <td>${escapeHtml(r.asset_name || '')}</td>
+        <td>${escapeHtml(r.site_name || '')}</td>
+        <td>${fmt(r.soc_pct)}</td>
+        <td>${fmt(r.soc_mwhr)}</td>
+        <td>${fmt(r.capacity_mwhr)}</td>
+        <td>${fmt(r.current_mw)}</td>
+        <td>${fmt(r.setpoint_mw)}</td>
+        <td>${fmt(r.min_mw)}</td>
+        <td>${fmt(r.max_mw)}</td>
+        <td>${escapeHtml(r.status || '')}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    $('hist_meta').textContent = `${list.length} rows`;
+  }
+
+  async function loadTelemetryHistory() {
+    if (!selectedAssetId) return;
+    const start = $('hist_start').value.trim();
+    const end = $('hist_end').value.trim();
+    const qs = new URLSearchParams();
+    if (start) qs.set('start', start);
+    if (end) qs.set('end', end);
+    const url = qs.toString() ? `/telemetry/${selectedAssetId}/history?${qs}` : `/telemetry/${selectedAssetId}/history`;
+    try {
+      const rows = await fetchJson(url);
+      renderTelemetryHistory(rows);
+    } catch (e) {
+      renderTelemetryHistory([]);
+      $('hist_meta').textContent = `error: ${String(e)}`;
+    }
+  }
+
+  function fmt(v) {
+    if (v == null) return '';
+    if (typeof v === 'number') return Number.isFinite(v) ? v.toFixed(2) : String(v);
+    return String(v);
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  async function loadAssets() {
+    const assets = await fetchJson('/assets');
+    ASSETS = Array.isArray(assets) ? assets : [];
+    SITES = new Map();
+    for (const a of ASSETS) {
+      if (a.site_id && a.site_name) SITES.set(a.site_id, a.site_name);
+    }
+    rebuildSelectors();
+    renderAssetsTable();
+  }
+
+  async function loadAgents() {
+    const agents = await fetchJson('/agents');
+    renderAgentsTable(Array.isArray(agents) ? agents : []);
+  }
+
+  async function loadDispatchHistory() {
+    const rows = await fetchJson('/dispatch/history');
+    renderDispatchHistory(Array.isArray(rows) ? rows : []);
+  }
+
+  async function selectAsset(id, name) {
+    selectedAssetId = id;
+    $('selected_asset').textContent = `${name} (${id})`;
+    await refreshSelected();
+  }
+
+  async function refreshSelected() {
+    if (!selectedAssetId) return;
+    try {
+      const t = await fetchJson(`/telemetry/${selectedAssetId}`);
+      $('telemetry_json').textContent = pretty(t);
+    } catch (e) {
+      $('telemetry_json').textContent = pretty({ error: String(e) });
+    }
+
+    try {
+      const hb = await fetchJson(`/heartbeat/${selectedAssetId}`);
+      $('heartbeat_json').textContent = pretty(hb);
+    } catch (e) {
+      $('heartbeat_json').textContent = pretty({ error: String(e) });
+    }
+    await loadTelemetryHistory();
+  }
+
+  async function sendDispatch() {
+    const mode = dispatchMode();
+    const mw = Number($('mw').value);
+    const durRaw = $('duration_s').value;
+    const duration_s = durRaw === '' ? null : Number(durRaw);
+
+    if (!Number.isFinite(mw)) {
+      setStatus(false, 'MW must be a number');
+      return;
+    }
+
+    const payload = { mw };
+    if (duration_s != null && Number.isFinite(duration_s)) payload.duration_s = duration_s;
+
+    if (mode === 'asset') {
+      const asset_id = $('asset_select').value;
+      if (!asset_id) { setStatus(false, 'Select an asset'); return; }
+      payload.asset_id = asset_id;
+    } else {
+      const site_id = $('site_select').value;
+      if (!site_id) { setStatus(false, 'Select a site'); return; }
+      payload.site_id = site_id;
+    }
+
+    try {
+      const res = await fetchJson('/dispatch', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      $('dispatch_resp').textContent = pretty(res);
+      setStatus(true, 'Dispatch accepted');
+      loadDispatchHistory().catch(() => {});
+      if (payload.asset_id) {
+        selectedAssetId = payload.asset_id;
+        const a = ASSETS.find(x => x.id === payload.asset_id);
+        $('selected_asset').textContent = a ? `${a.name} (${a.id})` : payload.asset_id;
+        refreshSelected().catch(() => {});
+      }
+    } catch (e) {
+      $('dispatch_resp').textContent = pretty({ error: String(e), payload });
+      setStatus(false, 'Dispatch failed');
+    }
+  }
+
+  function wireUi() {
+    const radios = document.querySelectorAll('input[name="dispatch_mode"]');
+    for (const r of radios) {
+      r.addEventListener('change', () => {
+        const mode = dispatchMode();
+        $('asset_select').style.display = (mode === 'asset') ? 'inline-block' : 'none';
+        $('site_select').style.display = (mode === 'site') ? 'inline-block' : 'none';
+      });
+    }
+
+    $('dispatch_btn').addEventListener('click', () => sendDispatch());
+    $('clear_resp').addEventListener('click', () => { $('dispatch_resp').textContent = '{}'; });
+    $('refresh_assets').addEventListener('click', () => loadAssets().catch(err => setStatus(false, String(err))));
+    $('refresh_agents').addEventListener('click', () => loadAgents().catch(err => setStatus(false, String(err))));
+    $('refresh_dispatch_hist').addEventListener('click', () => loadDispatchHistory().catch(err => setStatus(false, String(err))));
+    $('refresh_selected').addEventListener('click', () => refreshSelected().catch(() => {}));
+    $('load_hist').addEventListener('click', () => loadTelemetryHistory().catch(() => {}));
+
+    $('site_select').style.display = 'none';
+  }
+
+  async function boot() {
+    wireUi();
+    try {
+      await loadAssets();
+      await loadAgents();
+      await loadDispatchHistory();
+      if (ASSETS.length) selectAsset(ASSETS[0].id, ASSETS[0].name);
+      setInterval(() => loadAgents().catch(() => {}), 2000);
+      setInterval(() => loadDispatchHistory().catch(() => {}), 4000);
+    } catch (e) {
+      $('dispatch_resp').textContent = pretty({ error: String(e) });
+      setStatus(false, 'UI boot failed');
+    }
+  }
+
+  boot();
+</script>
+
+</body>
+</html>"#,
     )
 }
 

@@ -15,7 +15,8 @@ It is intentionally split into a lightweight **headend** (control plane) and one
 
 ### MVP (what this implementation demonstrates)
 - **DER telemetry ingestion:** collect periodic telemetry from multiple assets and expose “latest known” values via API.
-- **Operator dispatch:** send a MW setpoint to a single asset (point control) or to a site (aggregate control).
+- **Operator dispatch (BESS charge/discharge):** send a signed MW setpoint to a single asset (point control) or to a site (aggregate control).
+  - Convention (MVP): **positive MW = discharge/export**, **negative MW = charge/import** (clamped to each asset’s `min_mw`/`max_mw`).
 - **Edge Gateway Mode:** represent multiple assets at a site with one agent process and one outbound gRPC stream.
 - **Ops visibility:** list assets and show connection status + recent sessions.
 
@@ -34,6 +35,7 @@ It is intentionally split into a lightweight **headend** (control plane) and one
 ### Functional
 - Load an asset inventory from YAML and expose it via `GET /assets`.
 - Accept dispatch commands over REST and deliver them over gRPC to the correct connected agent.
+- Support **simple BESS charge/discharge control** via signed MW setpoints (positive=discharge, negative=charge) with per-asset clamping.
 - Provide stable operator-facing interfaces:
   - REST: `/assets`, `/agents`, `/telemetry/:asset_id`, `/dispatch`
   - gRPC: bidirectional stream for Register/Telemetry/Heartbeat (agent→headend) and Setpoint (headend→agent)
@@ -86,6 +88,7 @@ It is intentionally split into a lightweight **headend** (control plane) and one
 - **Dispatch** (implemented)
   - Per-asset: `POST /dispatch { "asset_id": "…", "mw": N }` routes to exactly one asset.
   - Per-site: `POST /dispatch { "site_id": "…", "mw": N }` routes to the gateway agent (site-level command).
+  - For BESS-style assets in the MVP, MW is signed: **positive=discharge**, **negative=charge** (subject to min/max clamps).
 
 - **Target precedence rule (important)**
   - If a `Setpoint` includes both `asset_id` and `site_id`, the agent treats it as **per-asset** (asset_id wins) to avoid accidental fanout.
@@ -104,6 +107,7 @@ It is intentionally split into a lightweight **headend** (control plane) and one
 
 The MVP uses `edge_agent` as a **simulated DER controller/telemetry source** so the end-to-end control path can be tested without real devices.
 
+
 ### What the simulation does today
 - Loads an asset inventory (either from env vars in single-asset mode or from YAML in Gateway Mode).
 - Establishes an outbound gRPC stream to the headend.
@@ -112,6 +116,14 @@ The MVP uses `edge_agent` as a **simulated DER controller/telemetry source** so 
   - setpoint application,
   - last-seen timestamps / liveness).
 - Accepts `Setpoint` commands and updates the simulated asset state.
+
+### Simple BESS simulator behavior (current MVP)
+- The agent simulates BESS behavior for demo/testing: register → heartbeat/telemetry tick → accept setpoints.
+- Setpoints are signed MW: **+MW = discharge/export**, **-MW = charge/import**, clamped to `min_mw`/`max_mw`.
+- Single-asset mode: one simulated BESS per process.
+- Gateway Mode: one process represents multiple BESS assets at a `site_id`.
+  - Per-site dispatch triggers capacity-weighted split + clamping.
+  - Per-asset dispatch updates only the targeted asset (`asset_id` wins over `site_id`).
 
 ### How to run it for tests
 - **Single-asset mode:** start one `edge_agent` per asset (often via `agent_launcher`).
