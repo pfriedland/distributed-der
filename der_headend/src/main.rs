@@ -27,7 +27,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sim_core::{Asset, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
+use sim_core::{Asset, BessEvent, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::{StreamExt as TokioStreamExt, wrappers::ReceiverStream};
@@ -40,7 +40,7 @@ pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    AgentToHeadend, DispatchAck, HeadendToAgent, Register, Setpoint,
+    AgentToHeadend, DispatchAck, Event as ProtoEvent, HeadendToAgent, Register, Setpoint,
     agent_link_server::{AgentLink, AgentLinkServer},
     agent_to_headend, headend_to_agent,
 };
@@ -60,8 +60,6 @@ struct AppState {
     pending_setpoints: Arc<RwLock<HashMap<Uuid, Dispatch>>>,
     // Tracks SOC state to avoid spamming events.
     soc_state: Arc<RwLock<HashMap<Uuid, SocState>>>,
-    // Last random event time per asset to throttle synthetic events.
-    last_random_event: Arc<RwLock<HashMap<Uuid, DateTime<Utc>>>>,
 }
 
 /// Connection info for a live agent stream.
@@ -376,7 +374,6 @@ async fn main() -> Result<()> {
         agent_streams: Arc::new(RwLock::new(HashMap::new())),
         pending_setpoints: Arc::new(RwLock::new(HashMap::new())),
         soc_state: Arc::new(RwLock::new(HashMap::new())),
-        last_random_event: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Spawn the tick loop on a background task.
@@ -694,6 +691,13 @@ impl AgentLink for GrpcApi {
                             tracing::warn!("dispatch ack handling failed: {err}");
                         }
                     }
+                    Ok(AgentToHeadend {
+                        msg: Some(agent_to_headend::Msg::Event(evt)),
+                    }) => {
+                        if let Err(err) = handle_agent_event(&state, evt).await {
+                            tracing::warn!("event handling failed: {err}");
+                        }
+                    }
                     Ok(_) => {}
                     Err(err) => {
                         let primary = asset_ids.get(0).map(|(id, _, _)| *id);
@@ -765,7 +769,6 @@ async fn handle_agent_telemetry(state: &AppState, t: proto::Telemetry) -> Result
     if let Some(db) = state.db.as_ref() {
         persist_telemetry(db, &[snap.clone()]).await?;
         maybe_emit_soc_event(state, db, &snap).await?;
-        maybe_emit_random_event(state, db, &snap).await?;
     }
 
     Ok(())
@@ -861,7 +864,7 @@ async fn maybe_emit_soc_event(state: &AppState, db: &PgPool, snap: &Telemetry) -
         id: Uuid::new_v4(),
         asset_id: snap.asset_id,
         site_id: asset.site_id,
-        ts: snap.timestamp,
+        timestamp: snap.timestamp,
         event_type: event_type.to_string(),
         severity: "warning".to_string(),
         message: message.to_string(),
@@ -870,42 +873,26 @@ async fn maybe_emit_soc_event(state: &AppState, db: &PgPool, snap: &Telemetry) -
     Ok(())
 }
 
-async fn maybe_emit_random_event(state: &AppState, db: &PgPool, snap: &Telemetry) -> Result<()> {
-    const PROB: f64 = 0.005; // 0.5% chance per telemetry tick
-    const MIN_INTERVAL_SECS: i64 = 120;
-
-    let roll: f64 = rand::random();
-    if roll > PROB {
-        return Ok(());
-    }
-
-    let mut last = state.last_random_event.write().await;
-    if let Some(prev) = last.get(&snap.asset_id) {
-        if (snap.timestamp - *prev).num_seconds() < MIN_INTERVAL_SECS {
-            return Ok(());
-        }
-    }
-    last.insert(snap.asset_id, snap.timestamp);
-
-    let templates = [
-        ("RACK_FAULT", "warning", "Rack 2/4 Trouble"),
-        ("HVAC_FAILED", "alarm", "HVAC Failed"),
-        ("INVERTER_FAULT", "alarm", "Inverter Fault Detected"),
-        ("COMMS_DEGRADED", "warning", "Site comms degraded"),
-    ];
-    let idx = rand::random::<usize>() % templates.len();
-    let (event_type, severity, message) = templates[idx];
+async fn handle_agent_event(state: &AppState, evt: ProtoEvent) -> Result<()> {
+    let asset_id = Uuid::parse_str(&evt.asset_id)?;
+    let site_id = Uuid::parse_str(&evt.site_id)?;
+    let ts = DateTime::parse_from_rfc3339(&evt.timestamp)
+        .map(|dt| dt.with_timezone(&Utc))
+        .context("parsing event timestamp")?;
 
     let event = BessEvent {
-        id: Uuid::new_v4(),
-        asset_id: snap.asset_id,
-        site_id: snap.site_id,
-        ts: snap.timestamp,
-        event_type: event_type.to_string(),
-        severity: severity.to_string(),
-        message: message.to_string(),
+        id: Uuid::parse_str(&evt.id).unwrap_or_else(|_| Uuid::new_v4()),
+        asset_id,
+        site_id,
+        timestamp: ts,
+        event_type: evt.event_type,
+        severity: evt.severity,
+        message: evt.message,
     };
-    persist_event(db, &event).await?;
+
+    if let Some(db) = state.db.as_ref() {
+        persist_event(db, &event).await?;
+    }
     Ok(())
 }
 
@@ -1192,7 +1179,7 @@ async fn persist_event(pool: &PgPool, event: &BessEvent) -> Result<()> {
     .bind(event.id)
     .bind(event.asset_id)
     .bind(event.site_id)
-    .bind(event.ts)
+    .bind(event.timestamp)
     .bind(&event.event_type)
     .bind(&event.severity)
     .bind(&event.message)
@@ -2739,16 +2726,6 @@ struct EventRequest {
     message: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-struct BessEvent {
-    id: Uuid,
-    asset_id: Uuid,
-    site_id: Uuid,
-    ts: DateTime<Utc>,
-    event_type: String,
-    severity: String,
-    message: String,
-}
 
 /// Return recent dispatch records (DB-backed). Empty array if no DB configured.
 async fn list_dispatch_history(State(state): State<AppState>) -> Response {
@@ -2804,7 +2781,7 @@ async fn create_event(State(state): State<AppState>, Json(req): Json<EventReques
         id: Uuid::new_v4(),
         asset_id: req.asset_id,
         site_id: asset.site_id,
-        ts: Utc::now(),
+        timestamp: Utc::now(),
         event_type: req.event_type,
         severity: req.severity.unwrap_or_else(|| "warning".into()),
         message: req.message.unwrap_or_default(),

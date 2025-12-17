@@ -10,9 +10,9 @@
 use std::{fs, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{SecondsFormat, Utc, DateTime};
 use futures_util::StreamExt;
-use sim_core::{tick_asset, Asset, BessState, Telemetry};
+use sim_core::{tick_asset, Asset, BessEvent, BessState, Telemetry};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -24,7 +24,7 @@ pub mod proto {
 }
 use proto::{
     agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent, AgentToHeadend,
-    Register, Setpoint, Heartbeat, AssetDescriptor, DispatchAck,
+    Register, Setpoint, Heartbeat, AssetDescriptor, DispatchAck, Event as ProtoEvent,
 };
 
 #[derive(Clone)]
@@ -40,6 +40,9 @@ struct AssetRuntime {
     asset: Arc<Asset>,
     sim: Arc<RwLock<BessState>>,
     setpoint_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
+    soc_state: Arc<RwLock<SocState>>,
+    last_random_event: Arc<RwLock<Option<DateTime<Utc>>>>,
+    active_events: Arc<RwLock<std::collections::HashMap<String, DateTime<Utc>>>>,
 }
 
 #[tokio::main]
@@ -138,6 +141,7 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                     let mut sim_guard = sim.write().await;
                                     tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
                                 };
+                                let events = maybe_generate_events(&state, &asset, &snap).await;
                                 if tx
                                     .send(AgentToHeadend {
                                         msg: Some(agent_to_headend::Msg::Telemetry(
@@ -149,6 +153,22 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                 {
                                     tracing::warn!("telemetry channel closed; reconnecting");
                                     stream_alive = false;
+                                    break;
+                                }
+                                for event in events {
+                                    if tx
+                                        .send(AgentToHeadend {
+                                            msg: Some(agent_to_headend::Msg::Event(to_proto_event(&event))),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::warn!("event channel closed; reconnecting");
+                                        stream_alive = false;
+                                        break;
+                                    }
+                                }
+                                if !stream_alive {
                                     break;
                                 }
                             }
@@ -187,6 +207,20 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         max_mw: t.max_mw,
         min_mw: t.min_mw,
         status: t.status.clone(),
+    }
+}
+
+fn to_proto_event(e: &BessEvent) -> ProtoEvent {
+    ProtoEvent {
+        id: e.id.to_string(),
+        asset_id: e.asset_id.to_string(),
+        site_id: e.site_id.to_string(),
+        timestamp: e
+            .timestamp
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_type: e.event_type.clone(),
+        severity: e.severity.clone(),
+        message: e.message.clone(),
     }
 }
 
@@ -258,6 +292,190 @@ async fn send_dispatch_ack(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocState {
+    BelowMin,
+    InRange,
+    AboveMax,
+}
+
+async fn maybe_generate_events(
+    state: &AppState,
+    asset: &Asset,
+    snap: &Telemetry,
+) -> Vec<BessEvent> {
+    let mut events = Vec::new();
+    if let Some(e) = maybe_soc_event(state, asset, snap).await {
+        events.push(e);
+    }
+    events.extend(maybe_clear_random_events(state, asset, snap).await);
+    if let Some(e) = maybe_random_event(state, asset, snap).await {
+        events.push(e);
+    }
+    events
+}
+
+async fn maybe_soc_event(
+    state: &AppState,
+    asset: &Asset,
+    snap: &Telemetry,
+) -> Option<BessEvent> {
+    let (min_soc, max_soc) = soc_bounds(asset);
+    let eps = 1e-6;
+    let next = if snap.soc_mwhr <= min_soc + eps {
+        SocState::BelowMin
+    } else if snap.soc_mwhr >= max_soc - eps {
+        SocState::AboveMax
+    } else {
+        SocState::InRange
+    };
+
+    let runtime = {
+        let assets = state.assets.read().await;
+        assets.get(&asset.id).cloned()
+    };
+    let Some(rt) = runtime else {
+        return None;
+    };
+    let mut soc_state = rt.soc_state.write().await;
+    let prev = *soc_state;
+    if prev == next {
+        return None;
+    }
+    *soc_state = next;
+
+    let (event_type, severity, message) = match (next, prev) {
+        (SocState::BelowMin, _) => ("MIN_SOC_REACHED", "warning", "Min SOC reached"),
+        (SocState::AboveMax, _) => ("MAX_SOC_REACHED", "warning", "Max SOC reached"),
+        (SocState::InRange, SocState::BelowMin) => ("MIN_SOC_REACHED", "clear", "Min SOC cleared"),
+        (SocState::InRange, SocState::AboveMax) => ("MAX_SOC_REACHED", "clear", "Max SOC cleared"),
+        _ => return None,
+    };
+
+    Some(BessEvent {
+        id: Uuid::new_v4(),
+        asset_id: asset.id,
+        site_id: asset.site_id,
+        timestamp: snap.timestamp,
+        event_type: event_type.to_string(),
+        severity: severity.to_string(),
+        message: message.to_string(),
+    })
+}
+
+async fn maybe_random_event(
+    state: &AppState,
+    asset: &Asset,
+    snap: &Telemetry,
+) -> Option<BessEvent> {
+    const PROB: f64 = 0.005;
+    const MIN_INTERVAL_SECS: i64 = 120;
+
+    let roll: f64 = rand::random();
+    if roll > PROB {
+        return None;
+    }
+
+    let runtime = {
+        let assets = state.assets.read().await;
+        assets.get(&asset.id).cloned()
+    };
+    let Some(rt) = runtime else {
+        return None;
+    };
+    let mut last = rt.last_random_event.write().await;
+    if let Some(prev) = *last {
+        if (snap.timestamp - prev).num_seconds() < MIN_INTERVAL_SECS {
+            return None;
+        }
+    }
+    *last = Some(snap.timestamp);
+
+    let templates = [
+        ("RACK_FAULT", "warning", "Rack 2/4 Trouble"),
+        ("HVAC_FAILED", "alarm", "HVAC Failed"),
+        ("INVERTER_FAULT", "alarm", "Inverter Fault Detected"),
+        ("COMMS_DEGRADED", "warning", "Site comms degraded"),
+    ];
+    let runtime = {
+        let assets = state.assets.read().await;
+        assets.get(&asset.id).cloned()
+    };
+    let Some(rt) = runtime else {
+        return None;
+    };
+    let mut active = rt.active_events.write().await;
+    let available: Vec<_> = templates
+        .iter()
+        .filter(|(t, _, _)| !active.contains_key(*t))
+        .collect();
+    if available.is_empty() {
+        return None;
+    }
+    let idx = rand::random::<usize>() % available.len();
+    let (event_type, severity, message) = *available[idx];
+    active.insert(event_type.to_string(), snap.timestamp);
+
+    Some(BessEvent {
+        id: Uuid::new_v4(),
+        asset_id: asset.id,
+        site_id: asset.site_id,
+        timestamp: snap.timestamp,
+        event_type: event_type.to_string(),
+        severity: severity.to_string(),
+        message: message.to_string(),
+    })
+}
+
+async fn maybe_clear_random_events(
+    state: &AppState,
+    asset: &Asset,
+    snap: &Telemetry,
+) -> Vec<BessEvent> {
+    const CLEAR_AFTER_SECS: i64 = 300;
+    let runtime = {
+        let assets = state.assets.read().await;
+        assets.get(&asset.id).cloned()
+    };
+    let Some(rt) = runtime else {
+        return Vec::new();
+    };
+    let mut active = rt.active_events.write().await;
+    let mut cleared = Vec::new();
+    let mut to_remove = Vec::new();
+    for (event_type, started) in active.iter() {
+        if (snap.timestamp - *started).num_seconds() >= CLEAR_AFTER_SECS {
+            to_remove.push(event_type.clone());
+        }
+    }
+    for event_type in to_remove {
+        active.remove(&event_type);
+        cleared.push(BessEvent {
+            id: Uuid::new_v4(),
+            asset_id: asset.id,
+            site_id: asset.site_id,
+            timestamp: snap.timestamp,
+            event_type,
+            severity: "clear".to_string(),
+            message: "Cleared".to_string(),
+        });
+    }
+    cleared
+}
+
+fn soc_bounds(asset: &Asset) -> (f64, f64) {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    let min_mwhr = cap * min_pct / 100.0;
+    let max_mwhr = cap * max_pct / 100.0;
+    if min_mwhr <= max_mwhr {
+        (min_mwhr, max_mwhr)
+    } else {
+        (0.0, cap)
+    }
+}
+
 fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid, AssetRuntime>) {
     // Gateway Mode: load all assets for a site from YAML and serve them from one process.
     if let (Some(site_id), Some(path)) = (cfg.gateway_site_id, cfg.assets_path.as_deref()) {
@@ -283,11 +501,14 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
             current_mw: 0.0,
             setpoint_mw: 0.0,
         };
-            let runtime = AssetRuntime {
-                asset: Arc::new(asset),
-                sim: Arc::new(RwLock::new(sim_state)),
-                setpoint_timer: Arc::new(RwLock::new(None)),
-            };
+        let runtime = AssetRuntime {
+            asset: Arc::new(asset),
+            sim: Arc::new(RwLock::new(sim_state)),
+            setpoint_timer: Arc::new(RwLock::new(None)),
+            soc_state: Arc::new(RwLock::new(SocState::InRange)),
+            last_random_event: Arc::new(RwLock::new(None)),
+            active_events: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
             map.insert(asset_id, runtime);
         }
 
@@ -309,6 +530,9 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
         asset: Arc::new(asset),
         sim: Arc::new(RwLock::new(sim_state)),
         setpoint_timer: Arc::new(RwLock::new(None)),
+        soc_state: Arc::new(RwLock::new(SocState::InRange)),
+        last_random_event: Arc::new(RwLock::new(None)),
+        active_events: Arc::new(RwLock::new(std::collections::HashMap::new())),
     };
     let mut map = std::collections::HashMap::new();
     map.insert(asset_id, runtime);

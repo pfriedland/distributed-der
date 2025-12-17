@@ -56,12 +56,23 @@ message DispatchAck {
   string reason = 5;
 }
 
+message Event {
+  string id = 1;
+  string asset_id = 2;
+  string site_id = 3;
+  string timestamp = 4;
+  string event_type = 5;
+  string severity = 6;
+  string message = 7;
+}
+
 message AgentToHeadend {
   oneof msg {
     Register register = 1;
     Telemetry telemetry = 2;
     Heartbeat heartbeat = 3;
     DispatchAck dispatch_ack = 4;
+    Event event = 5;
   }
 }
 

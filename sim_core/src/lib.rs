@@ -65,6 +65,17 @@ pub struct DispatchRequest {
     pub clamped: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BessEvent {
+    pub id: Uuid,
+    pub asset_id: Uuid,
+    pub site_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub event_type: String,
+    pub severity: String,
+    pub message: String,
+}
+
 /// Advance a single asset state by dt_secs. Returns a telemetry snapshot.
 pub fn tick_asset(asset: &Asset, state: &mut BessState, dt_secs: f64) -> Telemetry {
     // Ramp toward setpoint (respecting ramp rate and min/max).
