@@ -1,0 +1,59 @@
+version: "3.9"
+name: integrated_system_edge
+
+services:
+  ignition-edge-gateway:
+    image: inductiveautomation/ignition:8.1.42
+    restart: unless-stopped
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_HTTP_PORT: "8088"
+      GATEWAY_HTTPS_PORT: "8043"
+    ports:
+      - "8088:8088"
+      - "8043:8043"
+    volumes:
+      - ignition-edge-gateway-data:/usr/local/bin/ignition/data:Z
+
+  ignition-edge-campus:
+    image: inductiveautomation/ignition:8.1.42
+    restart: unless-stopped
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_HTTP_PORT: "8089"
+      GATEWAY_HTTPS_PORT: "8044"
+    ports:
+      - "8089:8089"
+      - "8044:8044"
+    volumes:
+      - ignition-edge-campus-data:/usr/local/bin/ignition/data:Z
+
+  edge_agent_gateway:
+    build:
+      context: .
+      dockerfile: edge_agent/Dockerfile
+    restart: unless-stopped
+    environment:
+      HEADEND_GRPC: "host.docker.internal:50070"
+      GATEWAY_SITE_ID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+      ASSETS_PATH: "/config/assets_test.yaml"
+      RUST_LOG: "info"
+    volumes:
+      - ./der_headend/assets_test.yaml:/config/assets_test.yaml:ro,Z
+
+  edge_agent_campus:
+    build:
+      context: .
+      dockerfile: edge_agent/Dockerfile
+    restart: unless-stopped
+    environment:
+      HEADEND_GRPC: "host.docker.internal:50070"
+      GATEWAY_SITE_ID: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+      ASSETS_PATH: "/config/assets_test.yaml"
+      RUST_LOG: "info"
+    volumes:
+      - ./der_headend/assets_test.yaml:/config/assets_test.yaml:ro,Z
+
+volumes:
+  ignition-edge-gateway-data:
+  ignition-edge-campus-data:

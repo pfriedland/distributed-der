@@ -18,5 +18,27 @@ services:
       timeout: 5s
       retries: 5
 
+  der_headend:
+    build:
+      context: .
+      dockerfile: der_headend/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://bess:besspassword@postgres:5432/bess
+      HEADEND_HTTP_ADDR: 0.0.0.0:3001
+      HEADEND_GRPC_ADDR: 0.0.0.0:50070
+      RUST_LOG: info
+      ASSETS_PATH: /app/assets_test.yaml
+    ports:
+      - "3001:3001"
+      - "50070:50070"
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:

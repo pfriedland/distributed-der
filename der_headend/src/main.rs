@@ -382,6 +382,7 @@ async fn main() -> Result<()> {
     // Build the Axum router.
     let app = Router::new()
         .route("/", get(ui_home))
+        .route("/health", get(health))
         .route("/assets", get(list_assets))
         .route("/agents", get(list_agents))
         .route("/telemetry/{id}", get(latest_telemetry))
@@ -441,8 +442,12 @@ async fn main() -> Result<()> {
         );
 
     // Start HTTP and gRPC servers concurrently.
-    let http_addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
-    // Default gRPC port can be overridden by HEADEND_GRPC_ADDR (e.g., 127.0.0.1:50070)
+    // Default HTTP bind can be overridden by HEADEND_HTTP_ADDR (e.g., 0.0.0.0:3001)
+    let http_addr: SocketAddr = std::env::var("HEADEND_HTTP_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:3001".to_string())
+        .parse()
+        .expect("invalid HEADEND_HTTP_ADDR");
+    // Default gRPC port can be overridden by HEADEND_GRPC_ADDR (e.g., 0.0.0.0:50070)
     let grpc_addr: SocketAddr = std::env::var("HEADEND_GRPC_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
         .parse()
@@ -1941,6 +1946,41 @@ async fn ui_home() -> Html<&'static str> {
 </body>
 </html>"#,
     )
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    db: String,
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    if let Some(db) = state.db.as_ref() {
+        match sqlx::query("SELECT 1").execute(db).await {
+            Ok(_) => Json(HealthResponse {
+                status: "ok".to_string(),
+                db: "ok".to_string(),
+            })
+            .into_response(),
+            Err(err) => {
+                tracing::warn!(error = %err, "health db check failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(HealthResponse {
+                        status: "degraded".to_string(),
+                        db: "error".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            db: "disabled".to_string(),
+        })
+        .into_response()
+    }
 }
 
 async fn list_assets(State(state): State<AppState>) -> Json<Vec<Asset>> {
