@@ -2,6 +2,9 @@ sites:
   - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
     name: "Gateway-Test"
     location: "Local"
+  - id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "Campus-Test"
+    location: "Local"
 
 assets:
   # --- Site: Gateway-Test (multiple assets; split ratio by capacity_mwhr = 120:40:40 => 3:1:1) ---
@@ -11,6 +14,8 @@ assets:
     capacity_mwhr: 120
     max_mw: 60
     min_mw: -60
+    min_soc_pct: 10
+    max_soc_pct: 90
     efficiency: 0.92
     ramp_rate_mw_per_min: 1000
 
@@ -20,6 +25,8 @@ assets:
     capacity_mwhr: 40
     max_mw: 20
     min_mw: -20
+    min_soc_pct: 10
+    max_soc_pct: 90
     efficiency: 0.91
     ramp_rate_mw_per_min: 1000
 
@@ -29,5 +36,30 @@ assets:
     capacity_mwhr: 40
     max_mw: 20
     min_mw: -20
+    min_soc_pct: 10
+    max_soc_pct: 90
     efficiency: 0.90
+    ramp_rate_mw_per_min: 1000
+
+  # --- Site: Campus-Test (2 assets, 100:60 => 5:3 split) ---
+  - id: "7ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "CT-BESS-A"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 100
+    max_mw: 50
+    min_mw: -50
+    min_soc_pct: 15
+    max_soc_pct: 95
+    efficiency: 0.93
+    ramp_rate_mw_per_min: 1000
+
+  - id: "8ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    name: "CT-BESS-B"
+    site_id: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+    capacity_mwhr: 60
+    max_mw: 30
+    min_mw: -30
+    min_soc_pct: 10
+    max_soc_pct: 90
+    efficiency: 0.92
     ramp_rate_mw_per_min: 1000

@@ -84,8 +84,8 @@ impl Simulator {
         let mut state = HashMap::new();
         let mut dispatches = HashMap::new();
         for asset in &assets {
-            // Start each asset at 50% SOC and zero MW.
-            let soc = asset.capacity_mwhr * 0.5;
+            // Start each asset at mid-range SOC and zero MW.
+            let soc = initial_soc_mwhr(asset);
             state.insert(
                 asset.id,
                 BessState {
@@ -104,6 +104,7 @@ impl Simulator {
                     status: "accepted".to_string(),
                     reason: None,
                     submitted_at: Utc::now(),
+                    clamped: false,
                 },
             );
         }
@@ -141,6 +142,7 @@ impl Simulator {
             status: "accepted".to_string(),
             reason: None,
             submitted_at: Utc::now(),
+            clamped: req.clamped,
         };
         self.dispatches.insert(req.asset_id, dispatch.clone());
         Ok(dispatch)
@@ -156,6 +158,17 @@ impl Simulator {
             }
         }
         snaps
+    }
+}
+
+fn initial_soc_mwhr(asset: &Asset) -> f64 {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    if min_pct <= max_pct {
+        cap * (min_pct + max_pct) / 200.0
+    } else {
+        cap * 0.5
     }
 }
 
@@ -180,8 +193,20 @@ struct AssetCfg {
     capacity_mwhr: f64,
     max_mw: f64,
     min_mw: f64,
+    #[serde(default = "default_min_soc_pct")]
+    min_soc_pct: f64,
+    #[serde(default = "default_max_soc_pct")]
+    max_soc_pct: f64,
     efficiency: f64,
     ramp_rate_mw_per_min: f64,
+}
+
+fn default_min_soc_pct() -> f64 {
+    0.0
+}
+
+fn default_max_soc_pct() -> f64 {
+    100.0
 }
 
 async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
@@ -205,6 +230,8 @@ async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
             capacity_mwhr: cfg.capacity_mwhr,
             max_mw: cfg.max_mw,
             min_mw: cfg.min_mw,
+            min_soc_pct: cfg.min_soc_pct,
+            max_soc_pct: cfg.max_soc_pct,
             efficiency: cfg.efficiency,
             ramp_rate_mw_per_min: cfg.ramp_rate_mw_per_min,
         });
@@ -775,7 +802,8 @@ async fn init_db(pool: &PgPool) -> Result<()> {
             duration_s bigint,
             status text NOT NULL,
             reason text,
-            submitted_at timestamptz NOT NULL
+            submitted_at timestamptz NOT NULL,
+            clamped boolean NOT NULL DEFAULT false
         );
     "#,
     )
@@ -799,6 +827,10 @@ async fn init_db(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await
     .context("altering agent_sessions.disconnected_at")?;
+    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS clamped boolean NOT NULL DEFAULT false;"#)
+        .execute(pool)
+        .await
+        .context("altering dispatches.clamped")?;
 
     sqlx::query(
         r#"
@@ -884,8 +916,8 @@ async fn persist_assets(pool: &PgPool, assets: &[Asset]) -> Result<()> {
 async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at, clamped)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
     )
     .bind(d.id)
@@ -895,6 +927,7 @@ async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
     .bind(&d.status)
     .bind(&d.reason)
     .bind(d.submitted_at)
+    .bind(d.clamped)
     .execute(pool)
     .await
     .context("inserting dispatch row")?;
@@ -949,6 +982,7 @@ async fn ui_home() -> Html<&'static str> {
     .muted { color: #666; }
     .links a { margin-right: 10px; }
     .small { font-size: 12px; }
+    .clamped-row { background: #fff6e5; }
   </style>
 </head>
 <body>
@@ -991,6 +1025,20 @@ async fn ui_home() -> Html<&'static str> {
           <button id="clear_resp" class="small">Clear</button>
         </div>
         <pre id="dispatch_resp">{}</pre>
+        <div id="allocations_box" class="small" style="margin-top: 10px; display:none;">
+          <div class="muted" style="margin-bottom: 6px;">Allocations (clamped rows highlighted)</div>
+          <table>
+            <thead>
+              <tr>
+                <th>asset_id</th>
+                <th>mw_raw</th>
+                <th>mw_final</th>
+                <th>clamped</th>
+              </tr>
+            </thead>
+            <tbody id="allocations_tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -1025,13 +1073,15 @@ async fn ui_home() -> Html<&'static str> {
         <table>
           <thead>
             <tr>
-              <th>asset_name</th>
-              <th>asset_id</th>
-              <th>site_name</th>
               <th>site_id</th>
+              <th>site_name</th>
+              <th>asset_id</th>
+              <th>asset_name</th>
               <th>cap_mwhr</th>
               <th>min_mw</th>
               <th>max_mw</th>
+              <th>min_soc_pct</th>
+              <th>max_soc_pct</th>
             </tr>
           </thead>
           <tbody id="assets_tbody"></tbody>
@@ -1051,11 +1101,10 @@ async fn ui_home() -> Html<&'static str> {
         <table>
           <thead>
             <tr>
+              <th>connected_at</th>
               <th>connected</th>
-              <th>asset_name</th>
-              <th>asset_id</th>
               <th>site_name</th>
-              <th>site_id</th>
+              <th>asset_name</th>
               <th>peer</th>
               <th>sessions</th>
             </tr>
@@ -1079,8 +1128,10 @@ async fn ui_home() -> Html<&'static str> {
           <thead>
             <tr>
               <th>submitted_at</th>
-              <th>asset_id</th>
+              <th>site_name</th>
+              <th>asset_name</th>
               <th>mw</th>
+              <th>clamped</th>
               <th>duration_s</th>
               <th>status</th>
               <th>reason</th>
@@ -1101,8 +1152,15 @@ async fn ui_home() -> Html<&'static str> {
       </div>
 
       <div class="row" style="margin-top: 6px;">
-        <label class="small">start RFC3339 <input id="hist_start" type="text" placeholder="optional" style="width: 300px;" /></label>
-        <label class="small">end RFC3339 <input id="hist_end" type="text" placeholder="optional" style="width: 300px;" /></label>
+        <label class="small">asset
+          <select id="hist_asset_select" style="min-width: 360px;"></select>
+        </label>
+        <label class="small">start
+          <input id="hist_start" type="datetime-local" step="1" style="width: 300px;" />
+        </label>
+        <label class="small">end
+          <input id="hist_end" type="datetime-local" step="1" style="width: 300px;" />
+        </label>
         <span class="small muted">Note: returns an empty list if no DB is configured.</span>
       </div>
 
@@ -1111,8 +1169,8 @@ async fn ui_home() -> Html<&'static str> {
           <thead>
             <tr>
               <th>ts</th>
-              <th>asset_name</th>
               <th>site_name</th>
+              <th>asset_name</th>
               <th>soc_pct</th>
               <th>soc_mwhr</th>
               <th>capacity_mwhr</th>
@@ -1183,22 +1241,60 @@ async fn ui_home() -> Html<&'static str> {
       opt.textContent = `${siteName}  (${siteId})`;
       siteSel.appendChild(opt);
     }
+
+    const histSel = $('hist_asset_select');
+    histSel.innerHTML = '';
+    const histList = Array.isArray(ASSETS) ? [...ASSETS] : [];
+    histList.sort((a, b) => {
+      const as = (a.site_name || '').toLowerCase();
+      const bs = (b.site_name || '').toLowerCase();
+      if (as < bs) return -1;
+      if (as > bs) return 1;
+      const aa = (a.name || '').toLowerCase();
+      const ba = (b.name || '').toLowerCase();
+      if (aa < ba) return -1;
+      if (aa > ba) return 1;
+      return 0;
+    });
+    for (const a of histList) {
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = `${a.site_name} — ${a.name}`;
+      histSel.appendChild(opt);
+    }
+    if (selectedAssetId) {
+      histSel.value = selectedAssetId;
+    }
   }
 
   function renderAssetsTable() {
     const tbody = $('assets_tbody');
     tbody.innerHTML = '';
-    for (const a of ASSETS) {
+    const list = Array.isArray(ASSETS) ? [...ASSETS] : [];
+    list.sort((a, b) => {
+      const as = (a.site_name || '').toLowerCase();
+      const bs = (b.site_name || '').toLowerCase();
+      if (as < bs) return -1;
+      if (as > bs) return 1;
+      const aa = (a.name || '').toLowerCase();
+      const ba = (b.name || '').toLowerCase();
+      if (aa < ba) return -1;
+      if (aa > ba) return 1;
+      return 0;
+    });
+    for (const a of list) {
       const tr = document.createElement('tr');
       tr.onclick = () => selectAsset(a.id, a.name);
       tr.innerHTML = `
-        <td>${escapeHtml(a.name)}</td>
-        <td><code>${escapeHtml(a.id)}</code></td>
-        <td>${escapeHtml(a.site_name)}</td>
         <td><code>${escapeHtml(a.site_id)}</code></td>
+        <td>${escapeHtml(a.site_name)}</td>
+        <td><code>${escapeHtml(a.id)}</code></td>
+        <td>${escapeHtml(a.name)}</td>
         <td>${fmt(a.capacity_mwhr)}</td>
         <td>${fmt(a.min_mw)}</td>
         <td>${fmt(a.max_mw)}</td>
+        <td>${fmt(a.min_soc_pct)}</td>
+        <td>${fmt(a.max_soc_pct)}</td>
       `;
       tbody.appendChild(tr);
     }
@@ -1208,17 +1304,28 @@ async fn ui_home() -> Html<&'static str> {
   function renderAgentsTable(agents) {
     const tbody = $('agents_tbody');
     tbody.innerHTML = '';
-    for (const a of agents) {
+    const list = Array.isArray(agents) ? [...agents] : [];
+    list.sort((a, b) => {
+      const as = (a.site_name || '').toLowerCase();
+      const bs = (b.site_name || '').toLowerCase();
+      if (as < bs) return -1;
+      if (as > bs) return 1;
+      const aa = (a.asset_name || '').toLowerCase();
+      const ba = (b.asset_name || '').toLowerCase();
+      if (aa < ba) return -1;
+      if (aa > ba) return 1;
+      return 0;
+    });
+    for (const a of list) {
       const tr = document.createElement('tr');
       const ok = a.connected ? 'ok' : 'bad';
       const connText = a.connected ? 'connected' : 'disconnected';
       const sessionCount = Array.isArray(a.sessions) ? a.sessions.length : 0;
       tr.innerHTML = `
+        <td><code>${escapeHtml(formatTs(a.connected_at || ''))}</code></td>
         <td><span class="pill ${ok}">${connText}</span></td>
-        <td>${escapeHtml(a.asset_name || '')}</td>
-        <td><code>${escapeHtml(a.asset_id)}</code></td>
         <td>${escapeHtml(a.site_name || '')}</td>
-        <td><code>${escapeHtml(a.site_id)}</code></td>
+        <td>${escapeHtml(a.asset_name || '')}</td>
         <td><code>${escapeHtml(a.peer || '')}</code></td>
         <td>${sessionCount}</td>
       `;
@@ -1233,9 +1340,11 @@ async fn ui_home() -> Html<&'static str> {
     for (const r of rows) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td><code>${escapeHtml(r.submitted_at)}</code></td>
-        <td><code>${escapeHtml(r.asset_id)}</code></td>
+        <td><code>${escapeHtml(formatTs(r.submitted_at))}</code></td>
+        <td>${escapeHtml(r.site_name || '')}</td>
+        <td>${escapeHtml(r.asset_name || '')}</td>
         <td>${fmt(r.mw)}</td>
+        <td>${r.clamped ? 'yes' : 'no'}</td>
         <td>${r.duration_s == null ? '' : escapeHtml(String(r.duration_s))}</td>
         <td>${escapeHtml(r.status || '')}</td>
         <td>${escapeHtml(r.reason || '')}</td>
@@ -1245,6 +1354,29 @@ async fn ui_home() -> Html<&'static str> {
     $('dispatch_hist_meta').textContent = `${rows.length} rows`;
   }
 
+  function renderAllocations(res) {
+    const box = $('allocations_box');
+    const tbody = $('allocations_tbody');
+    tbody.innerHTML = '';
+    const list = res && Array.isArray(res.allocations) ? res.allocations : [];
+    if (!list.length) {
+      box.style.display = 'none';
+      return;
+    }
+    box.style.display = 'block';
+    for (const a of list) {
+      const tr = document.createElement('tr');
+      if (a.clamped) tr.classList.add('clamped-row');
+      tr.innerHTML = `
+        <td><code>${escapeHtml(a.asset_id)}</code></td>
+        <td>${fmt(a.mw_raw)}</td>
+        <td>${fmt(a.mw)}</td>
+        <td>${a.clamped ? 'yes' : 'no'}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
   function renderTelemetryHistory(rows) {
     const tbody = $('telemetry_hist_tbody');
     tbody.innerHTML = '';
@@ -1252,9 +1384,9 @@ async fn ui_home() -> Html<&'static str> {
     for (const r of list) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td><code>${escapeHtml(r.ts)}</code></td>
-        <td>${escapeHtml(r.asset_name || '')}</td>
+        <td><code>${escapeHtml(formatTs(r.ts))}</code></td>
         <td>${escapeHtml(r.site_name || '')}</td>
+        <td>${escapeHtml(r.asset_name || '')}</td>
         <td>${fmt(r.soc_pct)}</td>
         <td>${fmt(r.soc_mwhr)}</td>
         <td>${fmt(r.capacity_mwhr)}</td>
@@ -1271,8 +1403,8 @@ async fn ui_home() -> Html<&'static str> {
 
   async function loadTelemetryHistory() {
     if (!selectedAssetId) return;
-    const start = $('hist_start').value.trim();
-    const end = $('hist_end').value.trim();
+    const start = toIso($('hist_start').value.trim());
+    const end = toIso($('hist_end').value.trim());
     const qs = new URLSearchParams();
     if (start) qs.set('start', start);
     if (end) qs.set('end', end);
@@ -1290,6 +1422,39 @@ async fn ui_home() -> Html<&'static str> {
     if (v == null) return '';
     if (typeof v === 'number') return Number.isFinite(v) ? v.toFixed(2) : String(v);
     return String(v);
+  }
+
+  function toIso(value) {
+    if (!value) return '';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return '';
+    return dt.toISOString();
+  }
+
+  function formatTs(ts) {
+    if (!ts) return '';
+    const dt = new Date(ts);
+    if (Number.isNaN(dt.getTime())) return String(ts);
+    const dtf = new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    });
+    const parts = dtf.formatToParts(dt);
+    const get = (type) => parts.find(p => p.type === type)?.value || '';
+    const year = get('year');
+    const month = get('month');
+    const day = get('day');
+    const hour = get('hour');
+    const min = get('minute');
+    const sec = get('second');
+    const tz = get('timeZoneName').replace(/\s+/g, '');
+    return `${year}-${month}-${day}T${hour}:${min}:${sec} ${tz}`;
   }
 
   function escapeHtml(s) {
@@ -1325,6 +1490,7 @@ async fn ui_home() -> Html<&'static str> {
   async function selectAsset(id, name) {
     selectedAssetId = id;
     $('selected_asset').textContent = `${name} (${id})`;
+    $('hist_asset_select').value = id;
     await refreshSelected();
   }
 
@@ -1377,6 +1543,7 @@ async fn ui_home() -> Html<&'static str> {
         body: JSON.stringify(payload),
       });
       $('dispatch_resp').textContent = pretty(res);
+      renderAllocations(res);
       setStatus(true, 'Dispatch accepted');
       loadDispatchHistory().catch(() => {});
       if (payload.asset_id) {
@@ -1387,6 +1554,7 @@ async fn ui_home() -> Html<&'static str> {
       }
     } catch (e) {
       $('dispatch_resp').textContent = pretty({ error: String(e), payload });
+      renderAllocations(null);
       setStatus(false, 'Dispatch failed');
     }
   }
@@ -1402,12 +1570,22 @@ async fn ui_home() -> Html<&'static str> {
     }
 
     $('dispatch_btn').addEventListener('click', () => sendDispatch());
-    $('clear_resp').addEventListener('click', () => { $('dispatch_resp').textContent = '{}'; });
+    $('clear_resp').addEventListener('click', () => {
+      $('dispatch_resp').textContent = '{}';
+      renderAllocations(null);
+    });
     $('refresh_assets').addEventListener('click', () => loadAssets().catch(err => setStatus(false, String(err))));
     $('refresh_agents').addEventListener('click', () => loadAgents().catch(err => setStatus(false, String(err))));
     $('refresh_dispatch_hist').addEventListener('click', () => loadDispatchHistory().catch(err => setStatus(false, String(err))));
     $('refresh_selected').addEventListener('click', () => refreshSelected().catch(() => {}));
     $('load_hist').addEventListener('click', () => loadTelemetryHistory().catch(() => {}));
+    $('hist_asset_select').addEventListener('change', async (e) => {
+      const id = e.target.value;
+      const asset = ASSETS.find(a => a.id === id);
+      selectedAssetId = id;
+      $('selected_asset').textContent = asset ? `${asset.name} (${asset.id})` : id;
+      await refreshSelected();
+    });
 
     $('site_select').style.display = 'none';
   }
@@ -1419,7 +1597,7 @@ async fn ui_home() -> Html<&'static str> {
       await loadAgents();
       await loadDispatchHistory();
       if (ASSETS.length) selectAsset(ASSETS[0].id, ASSETS[0].name);
-      setInterval(() => loadAgents().catch(() => {}), 2000);
+      setInterval(() => loadAgents().catch(() => {}), 4000);
       setInterval(() => loadDispatchHistory().catch(() => {}), 4000);
     } catch (e) {
       $('dispatch_resp').textContent = pretty({ error: String(e) });
@@ -1620,48 +1798,48 @@ async fn create_dispatch(
         }
 
         let allocations = compute_site_allocations(&assets_meta, req.mw);
-        let alloc_views: Vec<AllocationView> = allocations
-            .iter()
-            .map(|(id, mw)| AllocationView {
-                asset_id: *id,
-                mw: *mw,
-            })
-            .collect();
         tracing::info!(
             "site dispatch split site_id={} mw_total={} allocations={:?}",
             site_id,
             req.mw,
-            alloc_views
+            allocations
         );
+        if allocations.iter().any(|a| a.clamped) {
+            tracing::info!(
+                "site dispatch clamped allocations site_id={} mw_total={}",
+                site_id,
+                req.mw
+            );
+        }
 
         let mut results = Vec::new();
-        for (asset_id, mw_alloc) in allocations {
+        for alloc in allocations.iter() {
             let one = IncomingDispatch {
-                asset_id: Some(asset_id),
+                asset_id: Some(alloc.asset_id),
                 site_id: Some(site_id),
-                mw: mw_alloc,
+                mw: alloc.mw,
                 duration_s: req.duration_s,
             };
-            match handle_single_dispatch(&state, one).await {
+            match handle_single_dispatch(&state, one, alloc.clamped).await {
                 Ok(dispatch) => results.push(dispatch),
                 Err(err) => {
                     tracing::error!(
                         "dispatch failed for asset_id={} site_id={}: {err}",
-                        asset_id,
+                        alloc.asset_id,
                         site_id
                     );
                 }
             }
         }
         return Json(SiteDispatchResult {
-            allocations: alloc_views,
+            allocations,
             dispatches: results,
         })
         .into_response();
     }
 
     // Single-asset dispatch.
-    match handle_single_dispatch(&state, req).await {
+    match handle_single_dispatch(&state, req, false).await {
         Ok(dispatch) => Json(dispatch).into_response(),
         Err(err) => {
             tracing::error!("dispatch failed: {err}");
@@ -1670,7 +1848,11 @@ async fn create_dispatch(
     }
 }
 
-async fn handle_single_dispatch(state: &AppState, req: IncomingDispatch) -> Result<Dispatch> {
+async fn handle_single_dispatch(
+    state: &AppState,
+    req: IncomingDispatch,
+    clamped: bool,
+) -> Result<Dispatch> {
     let asset_id = req
         .asset_id
         .context("asset_id required for single dispatch")?;
@@ -1715,6 +1897,7 @@ async fn handle_single_dispatch(state: &AppState, req: IncomingDispatch) -> Resu
         site_id: site_id_meta,
         mw: req.mw,
         duration_s: req.duration_s,
+        clamped,
     };
 
     let result = sim.set_dispatch(dispatch_req);
@@ -1772,13 +1955,21 @@ async fn handle_single_dispatch(state: &AppState, req: IncomingDispatch) -> Resu
 }
 
 /// Compute per-asset MW allocations for a site dispatch using capacity weights with clamping.
-fn compute_site_allocations(assets: &[Asset], mw_total: f64) -> Vec<(Uuid, f64)> {
+fn compute_site_allocations(assets: &[Asset], mw_total: f64) -> Vec<AllocationView> {
     if assets.is_empty() {
         return Vec::new();
     }
     let cap_sum: f64 = assets.iter().map(|a| a.capacity_mwhr).sum();
     if cap_sum <= f64::EPSILON {
-        return assets.iter().map(|a| (a.id, 0.0)).collect();
+        return assets
+            .iter()
+            .map(|a| AllocationView {
+                asset_id: a.id,
+                mw_raw: 0.0,
+                mw: 0.0,
+                clamped: false,
+            })
+            .collect();
     }
 
     let raw: Vec<f64> = assets
@@ -1863,8 +2054,26 @@ fn compute_site_allocations(assets: &[Asset], mw_total: f64) -> Vec<(Uuid, f64)>
 
     assets
         .iter()
-        .zip(clamped.into_iter())
-        .map(|(a, mw)| (a.id, mw))
+        .enumerate()
+        .map(|(i, a)| {
+            let raw_mw = raw.get(i).copied().unwrap_or(0.0);
+            let mw = clamped.get(i).copied().unwrap_or(0.0);
+            let clamped_flag = (raw_mw - mw).abs() > 1e-6;
+            if clamped_flag {
+                tracing::info!(
+                    "dispatch allocation clamped asset_id={} raw_mw={} clamped_mw={}",
+                    a.id,
+                    raw_mw,
+                    mw
+                );
+            }
+            AllocationView {
+                asset_id: a.id,
+                mw_raw: raw_mw,
+                mw,
+                clamped: clamped_flag,
+            }
+        })
         .collect()
 }
 
@@ -1956,6 +2165,7 @@ struct AgentView {
     site_name: String,
     peer: String,
     connected: bool,
+    connected_at: Option<DateTime<Utc>>,
     sessions: Vec<AgentSessionView>,
 }
 
@@ -1976,10 +2186,12 @@ struct AgentSessionRow {
     disconnected_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 struct AllocationView {
     asset_id: Uuid,
+    mw_raw: f64,
     mw: f64,
+    clamped: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -2107,6 +2319,7 @@ async fn list_agents(State(state): State<AppState>) -> Response {
             site_name,
             peer: stream.peer.clone(),
             connected: true,
+            connected_at: sessions.first().map(|s| s.connected_at),
             sessions,
         });
     }
@@ -2137,6 +2350,7 @@ async fn list_agents(State(state): State<AppState>) -> Response {
                 .map(|s| s.peer.clone())
                 .unwrap_or_else(|| "<not_connected>".into()),
             connected: false,
+            connected_at: sessions.first().map(|s| s.connected_at),
             sessions,
         });
     }
@@ -2148,11 +2362,14 @@ async fn list_agents(State(state): State<AppState>) -> Response {
 struct DispatchRow {
     id: Uuid,
     asset_id: Uuid,
+    asset_name: String,
+    site_name: String,
     mw: f64,
     duration_s: Option<i64>,
     status: String,
     reason: Option<String>,
     submitted_at: DateTime<Utc>,
+    clamped: bool,
 }
 
 /// Return recent dispatch records (DB-backed). Empty array if no DB configured.
@@ -2162,9 +2379,20 @@ async fn list_dispatch_history(State(state): State<AppState>) -> Response {
     };
     let rows = sqlx::query_as::<_, DispatchRow>(
         r#"
-        SELECT id, asset_id, mw, duration_s, status, reason, submitted_at
-        FROM dispatches
-        ORDER BY submitted_at DESC
+        SELECT
+            d.id,
+            d.asset_id,
+            COALESCE(a.name, '<unknown>') AS asset_name,
+            COALESCE(a.site_name, '<unknown>') AS site_name,
+            d.mw,
+            d.duration_s,
+            d.status,
+            d.reason,
+            d.submitted_at,
+            d.clamped
+        FROM dispatches d
+        LEFT JOIN assets a ON d.asset_id = a.id
+        ORDER BY d.submitted_at DESC
         LIMIT 200
         "#,
     )

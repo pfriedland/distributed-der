@@ -238,13 +238,13 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
         );
 
         let mut map = std::collections::HashMap::new();
-        for asset in assets {
-            let asset_id = asset.id;
-            let sim_state = BessState {
-                soc_mwhr: asset.capacity_mwhr * 0.5,
-                current_mw: 0.0,
-                setpoint_mw: 0.0,
-            };
+    for asset in assets {
+        let asset_id = asset.id;
+        let sim_state = BessState {
+            soc_mwhr: initial_soc_mwhr(&asset),
+            current_mw: 0.0,
+            setpoint_mw: 0.0,
+        };
             let runtime = AssetRuntime {
                 asset: Arc::new(asset),
                 sim: Arc::new(RwLock::new(sim_state)),
@@ -263,7 +263,7 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
     let asset = cfg.to_asset();
     let asset_id = asset.id;
     let sim_state = BessState {
-        soc_mwhr: asset.capacity_mwhr * 0.5,
+        soc_mwhr: initial_soc_mwhr(&asset),
         current_mw: 0.0,
         setpoint_mw: 0.0,
     };
@@ -429,6 +429,17 @@ fn compute_allocations(targets: &[AssetRuntime], mw_total: f64) -> Vec<f64> {
     clamped
 }
 
+fn initial_soc_mwhr(asset: &Asset) -> f64 {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    if min_pct <= max_pct {
+        cap * (min_pct + max_pct) / 200.0
+    } else {
+        cap * 0.5
+    }
+}
+
 async fn set_asset_setpoint(rt: &AssetRuntime, mw: f64, duration_s: Option<u64>) {
     {
         let mut sim = rt.sim.write().await;
@@ -535,8 +546,20 @@ struct YamlAsset {
     capacity_mwhr: f64,
     max_mw: f64,
     min_mw: f64,
+    #[serde(default = "default_min_soc_pct")]
+    min_soc_pct: f64,
+    #[serde(default = "default_max_soc_pct")]
+    max_soc_pct: f64,
     efficiency: f64,
     ramp_rate_mw_per_min: f64,
+}
+
+fn default_min_soc_pct() -> f64 {
+    0.0
+}
+
+fn default_max_soc_pct() -> f64 {
+    100.0
 }
 
 fn load_assets_for_site(path: &str, site_id: Uuid) -> Result<Vec<Asset>> {
@@ -571,6 +594,8 @@ fn load_assets_for_site(path: &str, site_id: Uuid) -> Result<Vec<Asset>> {
             capacity_mwhr: a.capacity_mwhr,
             max_mw: a.max_mw,
             min_mw: a.min_mw,
+            min_soc_pct: a.min_soc_pct,
+            max_soc_pct: a.max_soc_pct,
             efficiency: a.efficiency,
             ramp_rate_mw_per_min: a.ramp_rate_mw_per_min,
         });
@@ -593,6 +618,8 @@ struct AgentConfig {
     capacity_mwhr: f64,
     max_mw: f64,
     min_mw: f64,
+    min_soc_pct: f64,
+    max_soc_pct: f64,
     efficiency: f64,
     ramp_rate_mw_per_min: f64,
 
@@ -644,6 +671,8 @@ impl AgentConfig {
                 capacity_mwhr: 0.0,
                 max_mw: 0.0,
                 min_mw: 0.0,
+                min_soc_pct: 0.0,
+                max_soc_pct: 100.0,
                 efficiency: 1.0,
                 ramp_rate_mw_per_min: 0.0,
                 headend_grpc,
@@ -663,6 +692,14 @@ impl AgentConfig {
         let capacity_mwhr: f64 = std::env::var("CAPACITY_MWHR")?.parse()?;
         let max_mw: f64 = std::env::var("MAX_MW")?.parse()?;
         let min_mw: f64 = std::env::var("MIN_MW")?.parse()?;
+        let min_soc_pct: f64 = std::env::var("MIN_SOC_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let max_soc_pct: f64 = std::env::var("MAX_SOC_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100.0);
         let efficiency: f64 = std::env::var("EFFICIENCY")?.parse()?;
         let ramp_rate_mw_per_min: f64 = std::env::var("RAMP_RATE_MW_PER_MIN")?.parse()?;
 
@@ -678,6 +715,8 @@ impl AgentConfig {
             capacity_mwhr,
             max_mw,
             min_mw,
+            min_soc_pct,
+            max_soc_pct,
             efficiency,
             ramp_rate_mw_per_min,
             headend_grpc,
@@ -697,6 +736,8 @@ impl AgentConfig {
             capacity_mwhr: self.capacity_mwhr,
             max_mw: self.max_mw,
             min_mw: self.min_mw,
+            min_soc_pct: self.min_soc_pct,
+            max_soc_pct: self.max_soc_pct,
             efficiency: self.efficiency,
             ramp_rate_mw_per_min: self.ramp_rate_mw_per_min,
         }

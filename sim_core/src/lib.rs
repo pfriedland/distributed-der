@@ -15,6 +15,8 @@ pub struct Asset {
     pub capacity_mwhr: f64,
     pub max_mw: f64,
     pub min_mw: f64,
+    pub min_soc_pct: f64,
+    pub max_soc_pct: f64,
     pub efficiency: f64,
     pub ramp_rate_mw_per_min: f64,
 }
@@ -51,6 +53,7 @@ pub struct Dispatch {
     pub status: String,
     pub reason: Option<String>,
     pub submitted_at: DateTime<Utc>,
+    pub clamped: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -59,6 +62,7 @@ pub struct DispatchRequest {
     pub mw: f64, // positive = discharge, negative = charge
     pub duration_s: Option<u64>,
     pub site_id: Option<Uuid>,
+    pub clamped: bool,
 }
 
 /// Advance a single asset state by dt_secs. Returns a telemetry snapshot.
@@ -80,7 +84,19 @@ pub fn tick_asset(asset: &Asset, state: &mut BessState, dt_secs: f64) -> Telemet
     } else {
         energy_delta_mwh * eff
     };
-    state.soc_mwhr = (state.soc_mwhr - adjusted).clamp(0.0, asset.capacity_mwhr);
+    let (min_soc_mwhr, max_soc_mwhr) = soc_bounds(asset);
+    state.soc_mwhr = (state.soc_mwhr - adjusted).clamp(min_soc_mwhr, max_soc_mwhr);
+
+    // If we are at a SOC boundary and still moving in the wrong direction,
+    // zero the setpoint/current MW to stop dispatch.
+    let eps = 1e-6;
+    if state.soc_mwhr <= min_soc_mwhr + eps && state.current_mw > 0.0 {
+        state.setpoint_mw = 0.0;
+        state.current_mw = 0.0;
+    } else if state.soc_mwhr >= max_soc_mwhr - eps && state.current_mw < 0.0 {
+        state.setpoint_mw = 0.0;
+        state.current_mw = 0.0;
+    }
 
     let status = if state.current_mw > 0.1 {
         "discharging"
@@ -107,5 +123,18 @@ pub fn tick_asset(asset: &Asset, state: &mut BessState, dt_secs: f64) -> Telemet
         max_mw: asset.max_mw,
         min_mw: asset.min_mw,
         status: status.to_string(),
+    }
+}
+
+fn soc_bounds(asset: &Asset) -> (f64, f64) {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    let min_mwhr = cap * min_pct / 100.0;
+    let max_mwhr = cap * max_pct / 100.0;
+    if min_mwhr <= max_mwhr {
+        (min_mwhr, max_mwhr)
+    } else {
+        (0.0, cap)
     }
 }

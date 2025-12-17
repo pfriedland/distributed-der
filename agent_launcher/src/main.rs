@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, process::Stdio};
+use std::{collections::HashMap, process::Stdio};
 use tokio::{process::Command, task::JoinHandle};
 use uuid::Uuid;
 
@@ -29,8 +29,20 @@ struct AssetCfg {
     capacity_mwhr: f64,
     max_mw: f64,
     min_mw: f64,
+    #[serde(default = "default_min_soc_pct")]
+    min_soc_pct: f64,
+    #[serde(default = "default_max_soc_pct")]
+    max_soc_pct: f64,
     efficiency: f64,
     ramp_rate_mw_per_min: f64,
+}
+
+fn default_min_soc_pct() -> f64 {
+    0.0
+}
+
+fn default_max_soc_pct() -> f64 {
+    100.0
 }
 
 #[tokio::main]
@@ -94,6 +106,8 @@ fn build_envs(asset: &AssetCfg, site: &SiteCfg, headend_grpc: &str) -> HashMap<S
     envs.insert("CAPACITY_MWHR".into(), asset.capacity_mwhr.to_string());
     envs.insert("MAX_MW".into(), asset.max_mw.to_string());
     envs.insert("MIN_MW".into(), asset.min_mw.to_string());
+    envs.insert("MIN_SOC_PCT".into(), asset.min_soc_pct.to_string());
+    envs.insert("MAX_SOC_PCT".into(), asset.max_soc_pct.to_string());
     envs.insert("EFFICIENCY".into(), asset.efficiency.to_string());
     envs.insert(
         "RAMP_RATE_MW_PER_MIN".into(),
