@@ -24,7 +24,7 @@ pub mod proto {
 }
 use proto::{
     agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent, AgentToHeadend,
-    Register, Setpoint, Heartbeat, AssetDescriptor,
+    Register, Setpoint, Heartbeat, AssetDescriptor, DispatchAck,
 };
 
 #[derive(Clone)]
@@ -87,10 +87,11 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
 
                         // Task to handle incoming setpoints.
                         let setpoint_state = state.clone();
+                        let ack_tx = tx.clone();
                         tokio::spawn(async move {
                             while let Some(Ok(msg)) = inbound.next().await {
                                 if let Some(headend_to_agent::Msg::Setpoint(sp)) = msg.msg {
-                                    apply_setpoint(&setpoint_state, &sp).await;
+                                    apply_setpoint(&setpoint_state, &sp, &ack_tx).await;
                                 }
                             }
                             tracing::warn!("setpoint stream ended; will reconnect");
@@ -189,7 +190,11 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
     }
 }
 
-async fn apply_setpoint(state: &AppState, sp: &Setpoint) {
+async fn apply_setpoint(
+    state: &AppState,
+    sp: &Setpoint,
+    ack_tx: &tokio::sync::mpsc::Sender<AgentToHeadend>,
+) {
     // Resolve targets: site/group if provided; otherwise single asset_id.
     let targets = resolve_targets(state, sp).await;
     if targets.is_empty() {
@@ -208,6 +213,7 @@ async fn apply_setpoint(state: &AppState, sp: &Setpoint) {
     // Apply allocations per asset and manage timers.
     for (alloc, rt) in allocations.iter().zip(targets.iter()) {
         set_asset_setpoint(rt, *alloc, sp.duration_s).await;
+        send_dispatch_ack(ack_tx, sp, rt).await;
     }
 
     let sum: f64 = allocations.iter().sum();
@@ -218,6 +224,38 @@ async fn apply_setpoint(state: &AppState, sp: &Setpoint) {
         targets.len(),
         sum
     );
+}
+
+async fn send_dispatch_ack(
+    tx: &tokio::sync::mpsc::Sender<AgentToHeadend>,
+    sp: &Setpoint,
+    rt: &AssetRuntime,
+) {
+    let Some(dispatch_id) = sp.dispatch_id.as_ref().filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+
+    let ack = DispatchAck {
+        dispatch_id: dispatch_id.clone(),
+        asset_id: rt.asset.id.to_string(),
+        status: "applied".to_string(),
+        timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        reason: String::new(),
+    };
+
+    if tx
+        .send(AgentToHeadend {
+            msg: Some(agent_to_headend::Msg::DispatchAck(ack)),
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "failed to send dispatch ack dispatch_id={} asset_id={}",
+            dispatch_id,
+            rt.asset.id
+        );
+    }
 }
 
 fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid, AssetRuntime>) {

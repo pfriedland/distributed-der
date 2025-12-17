@@ -40,7 +40,7 @@ pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    AgentToHeadend, HeadendToAgent, Register, Setpoint,
+    AgentToHeadend, DispatchAck, HeadendToAgent, Register, Setpoint,
     agent_link_server::{AgentLink, AgentLinkServer},
     agent_to_headend, headend_to_agent,
 };
@@ -209,6 +209,14 @@ fn default_max_soc_pct() -> f64 {
     100.0
 }
 
+#[derive(sqlx::FromRow)]
+struct TelemetrySeed {
+    asset_id: Uuid,
+    soc_mwhr: f64,
+    current_mw: f64,
+    setpoint_mw: f64,
+}
+
 async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
     // Read the YAML file and map site/asset records into `sim_core::Asset`.
     // Python-ish: `data = yaml.safe_load(open(path))`
@@ -237,6 +245,54 @@ async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
         });
     }
     Ok(assets)
+}
+
+async fn hydrate_sim_state(sim: &mut Simulator, db: &PgPool) -> Result<()> {
+    let rows = sqlx::query_as::<_, TelemetrySeed>(
+        r#"
+        SELECT DISTINCT ON (asset_id)
+            asset_id,
+            soc_mwhr,
+            current_mw,
+            setpoint_mw
+        FROM telemetry
+        ORDER BY asset_id, ts DESC
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    .context("querying latest telemetry for state hydration")?;
+
+    let mut updated = 0usize;
+    for row in rows {
+        let Some(state) = sim.state.get_mut(&row.asset_id) else {
+            continue;
+        };
+        let Some(asset) = sim.assets.get(&row.asset_id) else {
+            continue;
+        };
+        state.soc_mwhr = clamp_soc(asset, row.soc_mwhr);
+        state.current_mw = row.current_mw.clamp(asset.min_mw, asset.max_mw);
+        state.setpoint_mw = row.setpoint_mw.clamp(asset.min_mw, asset.max_mw);
+        updated += 1;
+    }
+    if updated > 0 {
+        tracing::info!("hydrated simulator state from telemetry rows={}", updated);
+    }
+    Ok(())
+}
+
+fn clamp_soc(asset: &Asset, soc_mwhr: f64) -> f64 {
+    let cap = asset.capacity_mwhr.max(0.0);
+    let min_pct = asset.min_soc_pct.clamp(0.0, 100.0);
+    let max_pct = asset.max_soc_pct.clamp(0.0, 100.0);
+    let min_mwhr = cap * min_pct / 100.0;
+    let max_mwhr = cap * max_pct / 100.0;
+    if min_mwhr <= max_mwhr {
+        soc_mwhr.clamp(min_mwhr, max_mwhr)
+    } else {
+        soc_mwhr.clamp(0.0, cap)
+    }
 }
 
 async fn read_assets_file() -> Result<(PathBuf, String)> {
@@ -274,11 +330,14 @@ async fn main() -> Result<()> {
 
     // Load assets from YAML (with beginner-friendly error messages).
     let assets = load_assets_from_yaml().await?;
-    let simulator = Simulator::from_assets(assets.clone());
     let db = maybe_connect_db().await?;
     if let Some(db) = db.as_ref() {
         // Persist asset metadata so history queries can include names/locations.
         persist_assets(db, &assets).await?;
+    }
+    let mut simulator = Simulator::from_assets(assets.clone());
+    if let Some(db) = db.as_ref() {
+        hydrate_sim_state(&mut simulator, db).await?;
     }
 
     // Wrap shared state in Arc<RwLock> for Axum handlers and the tick loop.
@@ -515,6 +574,7 @@ impl AgentLink for GrpcApi {
                                                 duration_s: pending.duration_s.map(|d| d as u64),
                                                 site_id: Some(site_uuid.to_string()),
                                                 group_id: None,
+                                                dispatch_id: Some(pending.id.to_string()),
                                             })),
                                         })
                                         .await;
@@ -573,6 +633,7 @@ impl AgentLink for GrpcApi {
                                                 duration_s: pending.duration_s.map(|d| d as u64),
                                                 site_id: Some(site_uuid.to_string()),
                                                 group_id: None,
+                                                dispatch_id: Some(pending.id.to_string()),
                                             })),
                                         })
                                         .await;
@@ -592,6 +653,13 @@ impl AgentLink for GrpcApi {
                     }) => {
                         if let Err(err) = handle_agent_heartbeat(&state, hb).await {
                             tracing::warn!("heartbeat handling failed: {err}");
+                        }
+                    }
+                    Ok(AgentToHeadend {
+                        msg: Some(agent_to_headend::Msg::DispatchAck(ack)),
+                    }) => {
+                        if let Err(err) = handle_dispatch_ack(&state, ack).await {
+                            tracing::warn!("dispatch ack handling failed: {err}");
                         }
                     }
                     Ok(_) => {}
@@ -677,6 +745,33 @@ async fn handle_agent_heartbeat(state: &AppState, hb: proto::Heartbeat) -> Resul
 
     if let Some(db) = state.db.as_ref() {
         persist_heartbeat(db, asset_id, ts).await?;
+    }
+    Ok(())
+}
+
+async fn handle_dispatch_ack(state: &AppState, ack: DispatchAck) -> Result<()> {
+    let dispatch_id = Uuid::parse_str(&ack.dispatch_id)?;
+    let ts = DateTime::parse_from_rfc3339(&ack.timestamp)
+        .map(|dt| dt.with_timezone(&Utc))
+        .context("parsing dispatch ack timestamp")?;
+
+    if let Some(db) = state.db.as_ref() {
+        sqlx::query(
+            r#"
+            UPDATE dispatches
+            SET ack_status = $1,
+                acked_at = $2,
+                ack_reason = $3
+            WHERE id = $4
+            "#,
+        )
+        .bind(&ack.status)
+        .bind(ts)
+        .bind(&ack.reason)
+        .bind(dispatch_id)
+        .execute(db)
+        .await
+        .context("updating dispatch ack")?;
     }
     Ok(())
 }
@@ -831,6 +926,18 @@ async fn init_db(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("altering dispatches.clamped")?;
+    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS ack_status text;"#)
+        .execute(pool)
+        .await
+        .context("altering dispatches.ack_status")?;
+    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS acked_at timestamptz;"#)
+        .execute(pool)
+        .await
+        .context("altering dispatches.acked_at")?;
+    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS ack_reason text;"#)
+        .execute(pool)
+        .await
+        .context("altering dispatches.ack_reason")?;
 
     sqlx::query(
         r#"
@@ -916,8 +1023,8 @@ async fn persist_assets(pool: &PgPool, assets: &[Asset]) -> Result<()> {
 async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at, clamped)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at, clamped, ack_status, acked_at, ack_reason)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL)
         "#,
     )
     .bind(d.id)
@@ -1132,6 +1239,8 @@ async fn ui_home() -> Html<&'static str> {
               <th>asset_name</th>
               <th>mw</th>
               <th>clamped</th>
+              <th>ack_status</th>
+              <th>acked_at</th>
               <th>duration_s</th>
               <th>status</th>
               <th>reason</th>
@@ -1345,6 +1454,8 @@ async fn ui_home() -> Html<&'static str> {
         <td>${escapeHtml(r.asset_name || '')}</td>
         <td>${fmt(r.mw)}</td>
         <td>${r.clamped ? 'yes' : 'no'}</td>
+        <td>${escapeHtml(r.ack_status || '')}</td>
+        <td><code>${escapeHtml(formatTs(r.acked_at || ''))}</code></td>
         <td>${r.duration_s == null ? '' : escapeHtml(String(r.duration_s))}</td>
         <td>${escapeHtml(r.status || '')}</td>
         <td>${escapeHtml(r.reason || '')}</td>
@@ -1905,6 +2016,13 @@ async fn handle_single_dispatch(
 
     match result {
         Ok(dispatch) => {
+            // Persist dispatch to DB first so acks can update reliably.
+            if let Some(db) = state.db.as_ref() {
+                if let Err(err) = persist_dispatch(db, &dispatch).await {
+                    tracing::warn!("failed to persist dispatch: {err}");
+                }
+            }
+
             // If we know the agent stream, push the setpoint downstream.
             if let Err(err) = push_setpoint_to_agent(state, &dispatch).await {
                 tracing::warn!("failed to forward setpoint to agent: {err}");
@@ -1914,13 +2032,6 @@ async fn handle_single_dispatch(
                     .write()
                     .await
                     .insert(dispatch.asset_id, dispatch.clone());
-            }
-
-            // Persist dispatch to DB if available.
-            if let Some(db) = state.db.as_ref() {
-                if let Err(err) = persist_dispatch(db, &dispatch).await {
-                    tracing::warn!("failed to persist dispatch: {err}");
-                }
             }
             Ok(dispatch)
         }
@@ -2097,6 +2208,7 @@ async fn push_setpoint_to_agent(state: &AppState, dispatch: &Dispatch) -> Result
                 duration_s: dispatch.duration_s.map(|d| d as u64),
                 site_id: site_id.map(|s| s.to_string()),
                 group_id: None,
+                dispatch_id: Some(dispatch.id.to_string()),
             })),
         })
         .await
@@ -2370,6 +2482,8 @@ struct DispatchRow {
     reason: Option<String>,
     submitted_at: DateTime<Utc>,
     clamped: bool,
+    ack_status: Option<String>,
+    acked_at: Option<DateTime<Utc>>,
 }
 
 /// Return recent dispatch records (DB-backed). Empty array if no DB configured.
@@ -2389,7 +2503,9 @@ async fn list_dispatch_history(State(state): State<AppState>) -> Response {
             d.status,
             d.reason,
             d.submitted_at,
-            d.clamped
+            d.clamped,
+            d.ack_status,
+            d.acked_at
         FROM dispatches d
         LEFT JOIN assets a ON d.asset_id = a.id
         ORDER BY d.submitted_at DESC

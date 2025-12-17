@@ -45,6 +45,15 @@ message Setpoint {
   optional uint64 duration_s = 3;
   optional string site_id = 4;
   optional string group_id = 5;
+  optional string dispatch_id = 6;
+}
+
+message DispatchAck {
+  string dispatch_id = 1;
+  string asset_id = 2;
+  string status = 3;
+  string timestamp = 4;
+  string reason = 5;
 }
 
 message AgentToHeadend {
@@ -52,6 +61,7 @@ message AgentToHeadend {
     Register register = 1;
     Telemetry telemetry = 2;
     Heartbeat heartbeat = 3;
+    DispatchAck dispatch_ack = 4;
   }
 }
 
