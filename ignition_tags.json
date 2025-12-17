@@ -1,0 +1,490 @@
+{
+  "tags": [
+    {
+      "name": "Assets",
+      "tagType": "Folder",
+      "tags": [
+        {
+          "name": "GT-BESS-A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "telemetry",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "soc_pct",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "soc_mwhr",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "current_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "status",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            },
+            {
+              "name": "control",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "duration_s",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Int4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "dispatch_id",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": false
+                }
+              ]
+            },
+            {
+              "name": "events",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "last_event",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "GT-BESS-B",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "telemetry",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "soc_pct",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "soc_mwhr",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "current_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "status",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            },
+            {
+              "name": "control",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "duration_s",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Int4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "dispatch_id",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": false
+                }
+              ]
+            },
+            {
+              "name": "events",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "last_event",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "GT-BESS-C",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "telemetry",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "soc_pct",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "soc_mwhr",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "current_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "status",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            },
+            {
+              "name": "control",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "duration_s",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Int4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "dispatch_id",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": false
+                }
+              ]
+            },
+            {
+              "name": "events",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "last_event",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "CT-BESS-A",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "telemetry",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "soc_pct",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "soc_mwhr",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "current_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "status",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            },
+            {
+              "name": "control",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "duration_s",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Int4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "dispatch_id",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": false
+                }
+              ]
+            },
+            {
+              "name": "events",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "last_event",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "CT-BESS-B",
+          "tagType": "Folder",
+          "tags": [
+            {
+              "name": "telemetry",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "soc_pct",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "soc_mwhr",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "current_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": true
+                },
+                {
+                  "name": "status",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            },
+            {
+              "name": "control",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "setpoint_mw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "duration_s",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Int4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "dispatch_id",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": false
+                }
+              ]
+            },
+            {
+              "name": "events",
+              "tagType": "Folder",
+              "tags": [
+                {
+                  "name": "last_event",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "String",
+                  "value": "",
+                  "readOnly": true
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
