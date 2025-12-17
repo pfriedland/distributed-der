@@ -4,3 +4,5 @@ Cargo.lock
 archive
 *.save
 *.bk*
+.venv*
+.env*
