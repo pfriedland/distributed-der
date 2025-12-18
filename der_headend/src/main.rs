@@ -2678,10 +2678,14 @@ async fn list_agents(State(state): State<AppState>) -> Response {
         });
 
         // Prefer configured metadata when available (more stable than what the agent sent).
-        let (site_id, asset_name, site_name) = asset_meta
-            .get(asset_id)
-            .cloned()
-            .unwrap_or_else(|| (stream.site_id, stream.asset_name.clone(), stream.site_name.clone()));
+        let (site_id, asset_name, site_name) =
+            asset_meta.get(asset_id).cloned().unwrap_or_else(|| {
+                (
+                    stream.site_id,
+                    stream.asset_name.clone(),
+                    stream.site_name.clone(),
+                )
+            });
 
         list.push(AgentView {
             asset_id: *asset_id,
@@ -2708,8 +2712,16 @@ async fn list_agents(State(state): State<AppState>) -> Response {
             .unwrap_or_else(|| (Uuid::nil(), asset_name.clone(), site_name.clone()));
 
         // Prefer configured names when present.
-        let asset_name = if asset_name_cfg.is_empty() { asset_name } else { asset_name_cfg };
-        let site_name = if site_name_cfg.is_empty() { site_name } else { site_name_cfg };
+        let asset_name = if asset_name_cfg.is_empty() {
+            asset_name
+        } else {
+            asset_name_cfg
+        };
+        let site_name = if site_name_cfg.is_empty() {
+            site_name
+        } else {
+            site_name_cfg
+        };
 
         list.push(AgentView {
             asset_id,
@@ -2765,7 +2777,6 @@ struct EventRequest {
     severity: Option<String>,
     message: Option<String>,
 }
-
 
 /// Return recent dispatch records (DB-backed). Empty array if no DB configured.
 async fn list_dispatch_history(State(state): State<AppState>) -> Response {

@@ -49,8 +49,8 @@ fn default_max_soc_pct() -> f64 {
 async fn main() -> Result<()> {
     // Where to find assets.yaml; default to workspace root.
     let assets_path = std::env::var("ASSETS_PATH").unwrap_or_else(|_| "assets.yaml".to_string());
-    let headend_grpc = std::env::var("HEADEND_GRPC")
-        .unwrap_or_else(|_| "127.0.0.1:50070".to_string());
+    let headend_grpc =
+        std::env::var("HEADEND_GRPC").unwrap_or_else(|_| "127.0.0.1:50070".to_string());
 
     let assets = load_assets(&assets_path)?;
     let sites: HashMap<Uuid, SiteCfg> = assets.sites.into_iter().map(|s| (s.id, s)).collect();
