@@ -40,12 +40,10 @@ services:
       GATEWAY_SITE_ID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
       ASSETS_PATH: "/config/assets_test.yaml"
       RUST_LOG: "info"
-      OPCUA_ENDPOINT: "opc.tcp://host.docker.internal:62541"
-      OPCUA_SETPOINT_NODE: "ns=2;s=[edge]/Assets/GT-BESS-A/control/setpoint_mw"
+      OPCUA_CONFIG_PATH: "/config/opcua_map_gateway.yaml"
     volumes:
       - ./der_headend/assets_test.yaml:/config/assets_test.yaml:ro,Z
-      # Remove if not using OPCUA_CONFIG_PATH
-      #- ./der_headend/opcua_map_gateway.yaml:/config/opcua_map_gateway.yaml:ro,Z
+      - ./der_headend/opcua_map_gateway.yaml:/config/opcua_map_gateway.yaml:ro,Z
 
   edge_agent_campus:
     build:
@@ -57,12 +55,10 @@ services:
       GATEWAY_SITE_ID: "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
       ASSETS_PATH: "/config/assets_test.yaml"
       RUST_LOG: "info"
-      OPCUA_ENDPOINT: "opc.tcp://host.docker.internal:62542"
-      OPCUA_SETPOINT_NODE: "ns=2;s=[edge]/Assets/CT-BESS-A/control/setpoint_mw"
+      OPCUA_CONFIG_PATH: "/config/opcua_map_campus.yaml"
     volumes:
       - ./der_headend/assets_test.yaml:/config/assets_test.yaml:ro,Z
-      # Remove if not using OPCUA_CONFIG_PATH
-      #- ./der_headend/opcua_map_campus.yaml:/config/opcua_map_campus.yaml:ro,Z
+      - ./der_headend/opcua_map_campus.yaml:/config/opcua_map_campus.yaml:ro,Z
 
 volumes:
   ignition-edge-gateway-data:
