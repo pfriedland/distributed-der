@@ -9,22 +9,27 @@
 
 use std::{fs, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc, DateTime};
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
-use sim_core::{tick_asset, Asset, BessEvent, BessState, Telemetry};
+use opcua::client::prelude::{
+    AttributeService,
+    AttributeId, ClientBuilder, DataValue, EndpointDescription, IdentityToken, MessageSecurityMode,
+    NodeId, SecurityPolicy, UAString, UserTokenPolicy, Variant, WriteValue,
+};
+use serde::{Deserialize, Serialize};
+use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-use serde::Deserialize;
 
 pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent, AgentToHeadend,
-    Register, Setpoint, Heartbeat, AssetDescriptor, DispatchAck, Event as ProtoEvent,
+    AgentToHeadend, AssetDescriptor, DispatchAck, Event as ProtoEvent, Heartbeat, Register,
+    Setpoint, agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent,
 };
 
 #[derive(Clone)]
@@ -33,6 +38,7 @@ struct AppState {
     assets: Arc<RwLock<std::collections::HashMap<Uuid, AssetRuntime>>>,
     headend_grpc: String,
     gateway_id: String,
+    opcua: Option<Arc<OpcUaClient>>,
 }
 
 #[derive(Clone)]
@@ -50,18 +56,19 @@ async fn main() -> Result<()> {
     // Initialize tracing from RUST_LOG (e.g., RUST_LOG=info or debug).
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let cfg = AgentConfig::from_env()?;
     let (primary_asset_id, assets_map) = build_assets_map(&cfg);
+    let opcua = cfg.opcua.clone().map(OpcUaClient::new).map(Arc::new);
     let state = AppState {
         headend_grpc: cfg.headend_grpc.clone(),
         assets: Arc::new(RwLock::new(assets_map)),
         gateway_id: cfg.gateway_id.clone(),
+        opcua,
     };
 
     // Start the tick + gRPC stream in the background.
@@ -114,8 +121,10 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                             msg: Some(agent_to_headend::Msg::Heartbeat(
                                                 Heartbeat {
                                                     asset_id: asset_id.to_string(),
-                                                    timestamp: Utc::now()
-                                                        .to_rfc3339_opts(SecondsFormat::Millis, true),
+                                                    timestamp: Utc::now().to_rfc3339_opts(
+                                                        SecondsFormat::Millis,
+                                                        true,
+                                                    ),
                                                 },
                                             )),
                                         })
@@ -142,6 +151,16 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                     tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
                                 };
                                 let events = maybe_generate_events(&state, &asset, &snap).await;
+        if let Some(opc) = state.opcua.clone() {
+            if let Err(err) = opc.write_telemetry(&snap).await {
+                                        tracing::warn!(
+                                            "opc ua telemetry write failed: asset={} site={} err={:?}",
+                                            asset.name,
+                                            asset.site_name,
+                                            err
+                                        );
+                                    }
+                                }
                                 if tx
                                     .send(AgentToHeadend {
                                         msg: Some(agent_to_headend::Msg::Telemetry(
@@ -158,7 +177,9 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                 for event in events {
                                     if tx
                                         .send(AgentToHeadend {
-                                            msg: Some(agent_to_headend::Msg::Event(to_proto_event(&event))),
+                                            msg: Some(agent_to_headend::Msg::Event(
+                                                to_proto_event(&event),
+                                            )),
                                         })
                                         .await
                                         .is_err()
@@ -196,9 +217,7 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         asset_id: t.asset_id.to_string(),
         site_id: t.site_id.to_string(),
         site_name: t.site_name.clone(),
-        timestamp: t
-            .timestamp
-            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        timestamp: t.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
         soc_mwhr: t.soc_mwhr,
         soc_pct: t.soc_pct,
         capacity_mwhr: t.capacity_mwhr,
@@ -215,9 +234,7 @@ fn to_proto_event(e: &BessEvent) -> ProtoEvent {
         id: e.id.to_string(),
         asset_id: e.asset_id.to_string(),
         site_id: e.site_id.to_string(),
-        timestamp: e
-            .timestamp
-            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        timestamp: e.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
         event_type: e.event_type.clone(),
         severity: e.severity.clone(),
         message: e.message.clone(),
@@ -245,8 +262,9 @@ async fn apply_setpoint(
     let allocations = compute_allocations(&targets, mw_total);
 
     // Apply allocations per asset and manage timers.
+    let opcua = state.opcua.clone();
     for (alloc, rt) in allocations.iter().zip(targets.iter()) {
-        set_asset_setpoint(rt, *alloc, sp.duration_s).await;
+        set_asset_setpoint(rt, *alloc, sp.duration_s, opcua.clone()).await;
         send_dispatch_ack(ack_tx, sp, rt).await;
     }
 
@@ -315,11 +333,7 @@ async fn maybe_generate_events(
     events
 }
 
-async fn maybe_soc_event(
-    state: &AppState,
-    asset: &Asset,
-    snap: &Telemetry,
-) -> Option<BessEvent> {
+async fn maybe_soc_event(state: &AppState, asset: &Asset, snap: &Telemetry) -> Option<BessEvent> {
     let (min_soc, max_soc) = soc_bounds(asset);
     let eps = 1e-6;
     let next = if snap.soc_mwhr <= min_soc + eps {
@@ -482,7 +496,10 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
         let assets = load_assets_for_site(path, site_id)
             .expect("failed to load assets for gateway site (ASSETS_PATH/GATEWAY_SITE_ID)");
         if assets.is_empty() {
-            panic!("no assets found for gateway site_id={} in {}", site_id, path);
+            panic!(
+                "no assets found for gateway site_id={} in {}",
+                site_id, path
+            );
         }
 
         tracing::info!(
@@ -494,21 +511,21 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
         );
 
         let mut map = std::collections::HashMap::new();
-    for asset in assets {
-        let asset_id = asset.id;
-        let sim_state = BessState {
-            soc_mwhr: initial_soc_mwhr(&asset),
-            current_mw: 0.0,
-            setpoint_mw: 0.0,
-        };
-        let runtime = AssetRuntime {
-            asset: Arc::new(asset),
-            sim: Arc::new(RwLock::new(sim_state)),
-            setpoint_timer: Arc::new(RwLock::new(None)),
-            soc_state: Arc::new(RwLock::new(SocState::InRange)),
-            last_random_event: Arc::new(RwLock::new(None)),
-            active_events: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        };
+        for asset in assets {
+            let asset_id = asset.id;
+            let sim_state = BessState {
+                soc_mwhr: initial_soc_mwhr(&asset),
+                current_mw: 0.0,
+                setpoint_mw: 0.0,
+            };
+            let runtime = AssetRuntime {
+                asset: Arc::new(asset),
+                sim: Arc::new(RwLock::new(sim_state)),
+                setpoint_timer: Arc::new(RwLock::new(None)),
+                soc_state: Arc::new(RwLock::new(SocState::InRange)),
+                last_random_event: Arc::new(RwLock::new(None)),
+                active_events: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            };
             map.insert(asset_id, runtime);
         }
 
@@ -539,9 +556,7 @@ fn build_assets_map(cfg: &AgentConfig) -> (Uuid, std::collections::HashMap<Uuid,
     (asset_id, map)
 }
 
-async fn snapshot_assets(
-    state: &AppState,
-) -> Vec<(Uuid, Arc<Asset>, Arc<RwLock<BessState>>)> {
+async fn snapshot_assets(state: &AppState) -> Vec<(Uuid, Arc<Asset>, Arc<RwLock<BessState>>)> {
     let assets = state.assets.read().await;
     let mut rows: Vec<(Uuid, Arc<Asset>, Arc<RwLock<BessState>>)> = assets
         .iter()
@@ -574,11 +589,7 @@ async fn resolve_targets(state: &AppState, sp: &Setpoint) -> Vec<AssetRuntime> {
     }
 
     // If site_id is provided (and asset_id was empty/unknown), target all assets in that site.
-    if let Some(site_id) = sp
-        .site_id
-        .as_ref()
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
+    if let Some(site_id) = sp.site_id.as_ref().and_then(|s| Uuid::parse_str(s).ok()) {
         let mut site_assets: Vec<_> = assets
             .values()
             .filter(|rt| rt.asset.site_id == site_id)
@@ -648,11 +659,7 @@ fn compute_allocations(targets: &[AssetRuntime], mw_total: f64) -> Vec<f64> {
             break;
         }
 
-        for ((val, headroom), rt) in clamped
-            .iter_mut()
-            .zip(headrooms.iter())
-            .zip(targets.iter())
-        {
+        for ((val, headroom), rt) in clamped.iter_mut().zip(headrooms.iter()).zip(targets.iter()) {
             let share = headroom.abs() / total_headroom;
             let delta = residual * share;
             let candidate = *val + delta;
@@ -687,7 +694,10 @@ fn compute_allocations(targets: &[AssetRuntime], mw_total: f64) -> Vec<f64> {
             )
         })
         .collect();
-    tracing::info!("allocation_rows=(asset_id,cap_mwhr,weight,raw,clamped,min,max) {:?}", rows);
+    tracing::info!(
+        "allocation_rows=(asset_id,cap_mwhr,weight,raw,clamped,min,max) {:?}",
+        rows
+    );
     clamped
 }
 
@@ -702,7 +712,203 @@ fn initial_soc_mwhr(asset: &Asset) -> f64 {
     }
 }
 
-async fn set_asset_setpoint(rt: &AssetRuntime, mw: f64, duration_s: Option<u64>) {
+#[derive(Clone, Debug)]
+struct OpcUaConfig {
+    endpoint: String,
+    username: Option<String>,
+    password: Option<String>,
+    // Per-asset mapping; if missing, falls back to default_* nodes.
+    setpoints: std::collections::HashMap<Uuid, NodeId>,
+    telemetry_nodes: TelemetryNodes,
+    // Defaults used when an asset-specific mapping is absent.
+    default_setpoint: Option<NodeId>,
+    default_telemetry: TelemetryNodes,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TelemetryNodes {
+    current_mw: Option<NodeId>,
+    soc_pct: Option<NodeId>,
+    soc_mwhr: Option<NodeId>,
+    status: Option<NodeId>,
+}
+
+impl TelemetryNodes {
+    fn clone_with_defaults(&self, defaults: &TelemetryNodes) -> TelemetryNodes {
+        TelemetryNodes {
+            current_mw: self.current_mw.clone().or_else(|| defaults.current_mw.clone()),
+            soc_pct: self.soc_pct.clone().or_else(|| defaults.soc_pct.clone()),
+            soc_mwhr: self
+                .soc_mwhr
+                .clone()
+                .or_else(|| defaults.soc_mwhr.clone()),
+            status: self.status.clone().or_else(|| defaults.status.clone()),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct OpcUaConfigFile {
+    endpoint: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    setpoints: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    default_setpoint: Option<String>,
+    #[serde(default)]
+    telemetry: Option<OpcUaTelemetryMap>,
+    #[serde(default)]
+    default_telemetry: Option<OpcUaTelemetryMap>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Default)]
+struct OpcUaTelemetryMap {
+    #[serde(default)]
+    current_mw: Option<String>,
+    #[serde(default)]
+    soc_pct: Option<String>,
+    #[serde(default)]
+    soc_mwhr: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+impl OpcUaConfig {
+    fn from_env() -> Result<Option<Self>> {
+        // If config file is specified, load it first.
+        if let Ok(path) = std::env::var("OPCUA_CONFIG_PATH") {
+            if !path.trim().is_empty() {
+                let contents = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading OPCUA_CONFIG_PATH {}", path))?;
+                let parsed: OpcUaConfigFile =
+                    serde_yaml::from_str(&contents).context("parsing OPC UA config yaml")?;
+                return Self::from_file(parsed);
+            }
+        }
+
+        let endpoint = match std::env::var("OPCUA_ENDPOINT") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return Ok(None),
+        };
+
+        let default_setpoint = std::env::var("OPCUA_SETPOINT_NODE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let username = std::env::var("OPCUA_USERNAME").ok();
+        let password = std::env::var("OPCUA_PASSWORD").ok();
+        let default_telemetry = TelemetryNodes {
+            current_mw: std::env::var("OPCUA_NODE_CURRENT_MW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            soc_pct: std::env::var("OPCUA_NODE_SOC_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            soc_mwhr: std::env::var("OPCUA_NODE_SOC_MWHR")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            status: std::env::var("OPCUA_NODE_STATUS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        };
+
+        Ok(Some(Self {
+            endpoint,
+            username,
+            password,
+            setpoints: std::collections::HashMap::new(),
+            telemetry_nodes: TelemetryNodes::default(),
+            default_setpoint,
+            default_telemetry,
+        }))
+    }
+
+    fn from_file(file: OpcUaConfigFile) -> Result<Option<Self>> {
+        let endpoint = file.endpoint;
+        let username = file.username;
+        let password = file.password;
+
+        let mut setpoints = std::collections::HashMap::new();
+        for (k, v) in file.setpoints {
+            let id: Uuid = k.parse().map_err(|e| anyhow!("bad asset id {}: {e:?}", k))?;
+            let node: NodeId = v
+                .parse()
+                .map_err(|e| anyhow!("bad setpoint node {}: {e:?}", v))?;
+            setpoints.insert(id, node);
+        }
+        let default_setpoint = match file.default_setpoint {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad default setpoint node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+
+        let telemetry_nodes = Self::telemetry_map_to_nodes(&file.telemetry)?;
+        let default_telemetry = Self::telemetry_map_to_nodes(&file.default_telemetry)?;
+
+        Ok(Some(Self {
+            endpoint,
+            username,
+            password,
+            setpoints,
+            telemetry_nodes,
+            default_setpoint,
+            default_telemetry,
+        }))
+    }
+
+    fn telemetry_map_to_nodes(
+        map: &Option<OpcUaTelemetryMap>,
+    ) -> Result<TelemetryNodes> {
+        let Some(map) = map else { return Ok(TelemetryNodes::default()); };
+        let current_mw = match &map.current_mw {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry current_mw node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let soc_pct = match &map.soc_pct {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry soc_pct node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let soc_mwhr = match &map.soc_mwhr {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry soc_mwhr node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let status = match &map.status {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry status node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+
+        Ok(TelemetryNodes {
+            current_mw,
+            soc_pct,
+            soc_mwhr,
+            status,
+        })
+    }
+}
+
+async fn set_asset_setpoint(
+    rt: &AssetRuntime,
+    mw: f64,
+    duration_s: Option<u64>,
+    opcua: Option<Arc<OpcUaClient>>,
+) {
     {
         let mut sim = rt.sim.write().await;
         sim.setpoint_mw = mw;
@@ -735,6 +941,17 @@ async fn set_asset_setpoint(rt: &AssetRuntime, mw: f64, duration_s: Option<u64>)
         mw,
         duration_s
     );
+
+    if let Some(client) = opcua {
+        if let Err(err) = client.write_setpoint(rt.asset.id, mw).await {
+            tracing::warn!(
+                "opc ua setpoint write failed: asset={} site={} err={:?}",
+                rt.asset.name,
+                rt.asset.site_name,
+                err
+            );
+        }
+    }
 }
 
 async fn send_registration(
@@ -840,8 +1057,14 @@ fn load_assets_for_site(path: &str, site_id: Uuid) -> Result<Vec<Asset>> {
         .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let mut out = Vec::new();
-    for a in parsed.assets.into_iter().filter(|a| a.site_id == site_id_str) {
-        let asset_id: Uuid = a.id.parse().with_context(|| format!("bad asset id {}", a.id))?;
+    for a in parsed
+        .assets
+        .into_iter()
+        .filter(|a| a.site_id == site_id_str)
+    {
+        let asset_id: Uuid =
+            a.id.parse()
+                .with_context(|| format!("bad asset id {}", a.id))?;
         let site_uuid: Uuid = a
             .site_id
             .parse()
@@ -892,6 +1115,7 @@ struct AgentConfig {
     assets_path: Option<String>,
     gateway_site_id: Option<Uuid>,
     gateway_id: String,
+    opcua: Option<OpcUaConfig>,
 }
 
 impl AgentConfig {
@@ -903,6 +1127,7 @@ impl AgentConfig {
         } else {
             format!("http://{}", raw)
         };
+        let opcua = OpcUaConfig::from_env()?;
 
         // Optional gateway mode: if GATEWAY_SITE_ID is set, load all assets for that site from ASSETS_PATH.
         let gateway_site_id: Option<Uuid> = match std::env::var("GATEWAY_SITE_ID") {
@@ -941,6 +1166,7 @@ impl AgentConfig {
                 assets_path,
                 gateway_site_id: Some(site_uuid),
                 gateway_id,
+                opcua,
             });
         }
 
@@ -985,6 +1211,7 @@ impl AgentConfig {
             assets_path,
             gateway_site_id,
             gateway_id,
+            opcua,
         })
     }
 
@@ -1003,5 +1230,176 @@ impl AgentConfig {
             efficiency: self.efficiency,
             ramp_rate_mw_per_min: self.ramp_rate_mw_per_min,
         }
+    }
+}
+
+#[derive(Clone)]
+struct OpcUaClient {
+    cfg: OpcUaConfig,
+}
+
+impl OpcUaClient {
+    fn new(cfg: OpcUaConfig) -> Self {
+        Self { cfg }
+    }
+
+    fn telemetry_nodes_for_asset(&self, _asset_id: Uuid) -> TelemetryNodes {
+        // Currently uses shared defaults only; placeholder for per-asset telemetry maps if needed.
+        self.cfg
+            .telemetry_nodes
+            .clone_with_defaults(&self.cfg.default_telemetry)
+    }
+
+    async fn write_setpoint(&self, asset_id: Uuid, mw: f64) -> Result<()> {
+        let node = self
+            .cfg
+            .setpoints
+            .get(&asset_id)
+            .cloned()
+            .or_else(|| self.cfg.default_setpoint.clone());
+        let Some(node_id) = node else {
+            return Ok(()); // No mapping; skip silently.
+        };
+
+        let write = WriteValue {
+            node_id,
+            attribute_id: AttributeId::Value as u32,
+            index_range: UAString::null(),
+            value: DataValue {
+                value: Some(Variant::Double(mw)),
+                status: None,
+                source_timestamp: None,
+                source_picoseconds: None,
+                server_timestamp: None,
+                server_picoseconds: None,
+            },
+        };
+        self.write_values(vec![write]).await
+    }
+
+    async fn write_telemetry(&self, snap: &Telemetry) -> Result<()> {
+        let mut writes = Vec::new();
+        let nodes = self.telemetry_nodes_for_asset(snap.asset_id);
+
+        if let Some(node) = nodes.current_mw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Double(snap.current_mw)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soc_pct {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Double(snap.soc_pct)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soc_mwhr {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Double(snap.soc_mwhr)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.status {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::String(snap.status.clone().into())),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        self.write_values(writes).await
+    }
+
+    async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut client = ClientBuilder::new()
+                .application_name("edge_agent_opcua")
+                .application_uri("urn:edge_agent_opcua")
+                .trust_server_certs(true)
+                .create_sample_keypair(true)
+                .session_retry_limit(1)
+                .client()
+                .ok_or_else(|| anyhow!("opc ua client build failed"))?;
+
+            let endpoint: EndpointDescription = (
+                cfg.endpoint.as_str(),
+                SecurityPolicy::None.to_str(),
+                MessageSecurityMode::None,
+                UserTokenPolicy::anonymous(),
+            )
+                .into();
+
+            let identity = match (cfg.username.clone(), cfg.password.clone()) {
+                (Some(u), Some(p)) => IdentityToken::UserName(u, p),
+                _ => IdentityToken::Anonymous,
+            };
+
+            let session = client
+                .connect_to_endpoint(endpoint, identity)
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
+
+            let result = {
+                let session = session.write();
+                session.write(&writes)
+            };
+
+            match result {
+                Ok(statuses) => {
+                    if !statuses.iter().all(|s| s.is_good()) {
+                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                    }
+                }
+                Err(status) => return Err(anyhow!("opc ua write failed: {:?}", status)),
+            }
+
+            {
+                let session = session.write();
+                let _ = session.disconnect();
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))?
     }
 }

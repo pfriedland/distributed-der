@@ -6,5 +6,6 @@ members = [
   "edge_agent",
   "sim_core",
   "telemetry_event_layer",
-  "agent_launcher",
+  "agent_launcher"
 ]
+exclude = ["opc_test_client"]
