@@ -12,6 +12,7 @@ services:
     ports:
       - "8088:8088"
       - "8043:8043"
+      - "62541:62541"
     volumes:
       - ignition-edge-gateway-data:/usr/local/bin/ignition/data:Z
 
@@ -25,6 +26,7 @@ services:
     ports:
       - "8089:8089"
       - "8044:8044"
+      - "62542:62542"
     volumes:
       - ignition-edge-campus-data:/usr/local/bin/ignition/data:Z
 
