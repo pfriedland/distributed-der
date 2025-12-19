@@ -1251,15 +1251,26 @@ impl OpcUaClient {
     }
 
     async fn write_setpoint(&self, asset_id: Uuid, mw: f64) -> Result<()> {
-        let node = self
-            .cfg
-            .setpoints
-            .get(&asset_id)
-            .cloned()
-            .or_else(|| self.cfg.default_setpoint.clone());
-        let Some(node_id) = node else {
-            return Ok(()); // No mapping; skip silently.
+        let node = self.cfg.setpoints.get(&asset_id).cloned();
+        let (node_id, source) = match node {
+            Some(n) => (n, "asset"),
+            None => match self.cfg.default_setpoint.clone() {
+                Some(n) => (n, "default"),
+                None => {
+                    tracing::warn!(
+                        "opc ua setpoint mapping missing: asset_id={} (no default)",
+                        asset_id
+                    );
+                    return Ok(());
+                }
+            },
         };
+        tracing::info!(
+            "opc ua setpoint write: asset_id={} mw={} mapping={}",
+            asset_id,
+            mw,
+            source
+        );
 
         let write = WriteValue {
             node_id,
@@ -1352,12 +1363,18 @@ impl OpcUaClient {
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
         let cfg = self.cfg.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::info!(
+                "opc ua connect endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+
             let mut client = ClientBuilder::new()
                 .application_name("edge_agent_opcua")
                 .application_uri("urn:edge_agent_opcua")
                 .trust_server_certs(true)
                 .create_sample_keypair(true)
-                .session_retry_limit(1)
+                .session_retry_limit(5)
                 .client()
                 .ok_or_else(|| anyhow!("opc ua client build failed"))?;
 
