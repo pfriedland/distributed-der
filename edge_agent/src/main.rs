@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use opcua::client::prelude::{
     AttributeService,
     AttributeId, ClientBuilder, DataValue, EndpointDescription, IdentityToken, MessageSecurityMode,
-    NodeId, SecurityPolicy, UAString, UserTokenPolicy, Variant, WriteValue,
+    NodeId, SecurityPolicy, Session, UAString, UserTokenPolicy, Variant, WriteValue,
 };
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
@@ -719,10 +719,12 @@ struct OpcUaConfig {
     password: Option<String>,
     // Per-asset mapping; if missing, falls back to default_* nodes.
     setpoints: std::collections::HashMap<Uuid, NodeId>,
-    telemetry_nodes: TelemetryNodes,
+    telemetry_defaults: TelemetryNodes,
+    telemetry_assets: std::collections::HashMap<Uuid, TelemetryNodes>,
     // Defaults used when an asset-specific mapping is absent.
     default_setpoint: Option<NodeId>,
     default_telemetry: TelemetryNodes,
+    telemetry_interval: Duration,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -762,6 +764,10 @@ struct OpcUaConfigFile {
     telemetry: Option<OpcUaTelemetryMap>,
     #[serde(default)]
     default_telemetry: Option<OpcUaTelemetryMap>,
+    #[serde(default)]
+    telemetry_assets: std::collections::HashMap<String, OpcUaTelemetryMap>,
+    #[serde(default)]
+    telemetry_interval_s: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -800,7 +806,7 @@ impl OpcUaConfig {
 
         let username = std::env::var("OPCUA_USERNAME").ok();
         let password = std::env::var("OPCUA_PASSWORD").ok();
-        let default_telemetry = TelemetryNodes {
+        let telemetry_defaults = TelemetryNodes {
             current_mw: std::env::var("OPCUA_NODE_CURRENT_MW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -814,15 +820,22 @@ impl OpcUaConfig {
                 .ok()
                 .and_then(|s| s.parse().ok()),
         };
+        let telemetry_interval = std::env::var("OPCUA_TELEMETRY_INTERVAL_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(0));
 
         Ok(Some(Self {
             endpoint,
             username,
             password,
             setpoints: std::collections::HashMap::new(),
-            telemetry_nodes: TelemetryNodes::default(),
+            telemetry_defaults,
+            telemetry_assets: std::collections::HashMap::new(),
             default_setpoint,
-            default_telemetry,
+            default_telemetry: TelemetryNodes::default(),
+            telemetry_interval,
         }))
     }
 
@@ -847,17 +860,30 @@ impl OpcUaConfig {
             None => None,
         };
 
-        let telemetry_nodes = Self::telemetry_map_to_nodes(&file.telemetry)?;
+        let telemetry_defaults = Self::telemetry_map_to_nodes(&file.telemetry)?;
         let default_telemetry = Self::telemetry_map_to_nodes(&file.default_telemetry)?;
+        let telemetry_interval = file
+            .telemetry_interval_s
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(0));
+
+        let mut telemetry_assets = std::collections::HashMap::new();
+        for (k, v) in file.telemetry_assets {
+            let id: Uuid = k.parse().map_err(|e| anyhow!("bad asset id {}: {e:?}", k))?;
+            let nodes = Self::telemetry_map_to_nodes(&Some(v))?;
+            telemetry_assets.insert(id, nodes);
+        }
 
         Ok(Some(Self {
             endpoint,
             username,
             password,
             setpoints,
-            telemetry_nodes,
+            telemetry_defaults,
+            telemetry_assets,
             default_setpoint,
             default_telemetry,
+            telemetry_interval,
         }))
     }
 
@@ -1236,17 +1262,28 @@ impl AgentConfig {
 #[derive(Clone)]
 struct OpcUaClient {
     cfg: OpcUaConfig,
+    last_telemetry: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<opcua::sync::RwLock<Session>>>>>,
 }
 
 impl OpcUaClient {
     fn new(cfg: OpcUaConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            last_telemetry: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
     fn telemetry_nodes_for_asset(&self, _asset_id: Uuid) -> TelemetryNodes {
-        // Currently uses shared defaults only; placeholder for per-asset telemetry maps if needed.
+        // Per-asset nodes override shared defaults.
+        if let Some(nodes) = self.cfg.telemetry_assets.get(&_asset_id) {
+            return nodes.clone_with_defaults(&self.cfg.telemetry_defaults);
+        }
         self.cfg
-            .telemetry_nodes
+            .telemetry_defaults
             .clone_with_defaults(&self.cfg.default_telemetry)
     }
 
@@ -1289,6 +1326,19 @@ impl OpcUaClient {
     }
 
     async fn write_telemetry(&self, snap: &Telemetry) -> Result<()> {
+        if self.cfg.telemetry_interval > Duration::from_secs(0) {
+            let mut guard = self.last_telemetry.lock().await;
+            let now = std::time::Instant::now();
+            let allow = match guard.get(&snap.asset_id) {
+                Some(last) => now.duration_since(*last) >= self.cfg.telemetry_interval,
+                None => true,
+            };
+            if !allow {
+                return Ok(());
+            }
+            guard.insert(snap.asset_id, now);
+        }
+
         let mut writes = Vec::new();
         let nodes = self.telemetry_nodes_for_asset(snap.asset_id);
 
@@ -1361,8 +1411,45 @@ impl OpcUaClient {
     }
 
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
+        let session = self.get_or_connect_session().await?;
+        let writes_clone = writes.clone();
+        let write_result = tokio::task::spawn_blocking(move || -> Result<Vec<opcua::types::StatusCode>> {
+            let session = session.write();
+            session
+                .write(&writes_clone)
+                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
+
+        match write_result {
+            Ok(statuses) => {
+                if !statuses.iter().all(|s| s.is_good()) {
+                    self.drop_session().await;
+                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                }
+            }
+            Err(err) => {
+                self.drop_session().await;
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn get_or_connect_session(
+        &self,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        {
+            let guard = self.session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                return Ok(session.clone());
+            }
+        }
+
         let cfg = self.cfg.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let session = tokio::task::spawn_blocking(move || -> Result<_> {
             tracing::info!(
                 "opc ua connect endpoint={} user={}",
                 cfg.endpoint,
@@ -1391,32 +1478,20 @@ impl OpcUaClient {
                 _ => IdentityToken::Anonymous,
             };
 
-            let session = client
+            client
                 .connect_to_endpoint(endpoint, identity)
-                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
-
-            let result = {
-                let session = session.write();
-                session.write(&writes)
-            };
-
-            match result {
-                Ok(statuses) => {
-                    if !statuses.iter().all(|s| s.is_good()) {
-                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
-                    }
-                }
-                Err(status) => return Err(anyhow!("opc ua write failed: {:?}", status)),
-            }
-
-            {
-                let session = session.write();
-                let _ = session.disconnect();
-            }
-
-            Ok(())
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))
         })
         .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))??;
+
+        let mut guard = self.session.lock().await;
+        *guard = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn drop_session(&self) {
+        let mut guard = self.session.lock().await;
+        *guard = None;
     }
 }
