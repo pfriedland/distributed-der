@@ -152,7 +152,9 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                 let mut used_opcua = false;
 
                                 if let Some(opc) = opcua.clone() {
-                                    if opc.telemetry_enabled_for_asset(asset.id) {
+                                    if !opc.telemetry_write_sim_enabled()
+                                        && opc.telemetry_enabled_for_asset(asset.id)
+                                    {
                                         match opc.read_telemetry(asset.id).await {
                                             Ok(Some(sample)) => {
                                                 let sim_state = sim.read().await.clone();
@@ -176,16 +178,28 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                                     }
                                 }
 
-                                let snap = if let Some(snap) = snap_opt.take() {
-                                    snap
-                                } else {
-                                    let mut sim_guard = sim.write().await;
-                                    tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
-                                };
-                                let events = if used_opcua {
-                                    Vec::new()
-                                } else {
-                                    maybe_generate_events(&state, &asset, &snap).await
+        let snap = if let Some(snap) = snap_opt.take() {
+            snap
+        } else {
+            let mut sim_guard = sim.write().await;
+            tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
+        };
+        if !used_opcua {
+            if let Some(opc) = opcua.clone() {
+                if let Err(err) = opc.write_sim_telemetry(&snap).await {
+                    tracing::warn!(
+                        "opc ua telemetry write failed: asset={} site={} err={:?}",
+                        asset.name,
+                        asset.site_name,
+                        err
+                    );
+                }
+            }
+        }
+        let events = if used_opcua {
+            Vec::new()
+        } else {
+            maybe_generate_events(&state, &asset, &snap).await
                                 };
                                 if tx
                                     .send(AgentToHeadend {
@@ -787,6 +801,7 @@ struct OpcUaConfig {
     default_setpoint: Option<NodeId>,
     default_telemetry: TelemetryNodes,
     telemetry_interval: Duration,
+    telemetry_write_sim: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -830,6 +845,8 @@ struct OpcUaConfigFile {
     telemetry_assets: std::collections::HashMap<String, OpcUaTelemetryMap>,
     #[serde(default)]
     telemetry_interval_s: Option<u64>,
+    #[serde(default)]
+    telemetry_write_sim: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -887,6 +904,10 @@ impl OpcUaConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_write_sim = std::env::var("OPCUA_TELEMETRY_WRITE_SIM")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(false);
 
         Ok(Some(Self {
             endpoint,
@@ -898,6 +919,7 @@ impl OpcUaConfig {
             default_setpoint,
             default_telemetry: TelemetryNodes::default(),
             telemetry_interval,
+            telemetry_write_sim,
         }))
     }
 
@@ -928,6 +950,7 @@ impl OpcUaConfig {
             .telemetry_interval_s
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_write_sim = file.telemetry_write_sim.unwrap_or(false);
 
         let mut telemetry_assets = std::collections::HashMap::new();
         for (k, v) in file.telemetry_assets {
@@ -946,6 +969,7 @@ impl OpcUaConfig {
             default_setpoint,
             default_telemetry,
             telemetry_interval,
+            telemetry_write_sim,
         }))
     }
 
@@ -1361,6 +1385,10 @@ impl OpcUaClient {
             || nodes.status.is_some()
     }
 
+    fn telemetry_write_sim_enabled(&self) -> bool {
+        self.cfg.telemetry_write_sim
+    }
+
     async fn write_setpoint(&self, asset_id: Uuid, mw: f64) -> Result<()> {
         let node = self.cfg.setpoints.get(&asset_id).cloned();
         let (node_id, source) = match node {
@@ -1388,7 +1416,7 @@ impl OpcUaClient {
             attribute_id: AttributeId::Value as u32,
             index_range: UAString::null(),
             value: DataValue {
-                value: Some(Variant::Double(mw)),
+                value: Some(Variant::Float(mw as f32)),
                 status: None,
                 source_timestamp: None,
                 source_picoseconds: None,
@@ -1397,6 +1425,95 @@ impl OpcUaClient {
             },
         };
         self.write_values(vec![write]).await
+    }
+
+    async fn write_sim_telemetry(&self, snap: &Telemetry) -> Result<()> {
+        if !self.cfg.telemetry_write_sim {
+            return Ok(());
+        }
+
+        if self.cfg.telemetry_interval > Duration::from_secs(0) {
+            let mut guard = self.last_telemetry.lock().await;
+            let now = std::time::Instant::now();
+            let allow = match guard.get(&snap.asset_id) {
+                Some(last) => now.duration_since(*last) >= self.cfg.telemetry_interval,
+                None => true,
+            };
+            if !allow {
+                return Ok(());
+            }
+            guard.insert(snap.asset_id, now);
+        }
+
+        let nodes = self.telemetry_nodes_for_asset(snap.asset_id);
+        let mut writes = Vec::new();
+
+        if let Some(node) = nodes.current_mw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.current_mw as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soc_pct {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.soc_pct as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soc_mwhr {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.soc_mwhr as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.status {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::String(snap.status.clone().into())),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        self.write_values(writes).await
     }
 
     async fn read_telemetry(&self, asset_id: Uuid) -> Result<Option<OpcUaTelemetrySample>> {
@@ -1463,17 +1580,7 @@ impl OpcUaClient {
             return Ok(None);
         }
 
-        let session = self.get_or_connect_session().await?;
-        let values = tokio::task::spawn_blocking(move || -> Result<Vec<DataValue>> {
-            let session = session.write();
-            session
-                .read(&read_ids, TimestampsToReturn::Neither, 5_000.0)
-                .map_err(|status| anyhow!("opc ua read failed: {:?}", status))
-        })
-        .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
-
-        let values = match values {
+        let values = match self.read_values_transient(read_ids).await {
             Ok(values) => values,
             Err(err) => {
                 let cache = self.last_sample.lock().await;
@@ -1508,31 +1615,7 @@ impl OpcUaClient {
     }
 
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
-        let session = self.get_or_connect_session().await?;
-        let writes_clone = writes.clone();
-        let write_result = tokio::task::spawn_blocking(move || -> Result<Vec<opcua::types::StatusCode>> {
-            let session = session.write();
-            session
-                .write(&writes_clone)
-                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
-        })
-        .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
-
-        match write_result {
-            Ok(statuses) => {
-                if !statuses.iter().all(|s| s.is_good()) {
-                    self.drop_session().await;
-                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
-                }
-            }
-            Err(err) => {
-                self.drop_session().await;
-                return Err(err);
-            }
-        }
-
-        Ok(())
+        self.write_values_transient(writes).await
     }
 
     async fn get_or_connect_session(
@@ -1590,6 +1673,118 @@ impl OpcUaClient {
     async fn drop_session(&self) {
         let mut guard = self.session.lock().await;
         *guard = None;
+    }
+
+    fn connect_once(
+        cfg: &OpcUaConfig,
+        app_name: &str,
+        app_uri: &str,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        let mut client = ClientBuilder::new()
+            .application_name(app_name)
+            .application_uri(app_uri)
+            .trust_server_certs(true)
+            .create_sample_keypair(true)
+            .session_retry_limit(0)
+            .client()
+            .ok_or_else(|| anyhow!("opc ua client build failed"))?;
+
+        let endpoint: EndpointDescription = (
+            cfg.endpoint.as_str(),
+            SecurityPolicy::None.to_str(),
+            MessageSecurityMode::None,
+            UserTokenPolicy::anonymous(),
+        )
+            .into();
+
+        let identity = match (cfg.username.clone(), cfg.password.clone()) {
+            (Some(u), Some(p)) => IdentityToken::UserName(u, p),
+            _ => IdentityToken::Anonymous,
+        };
+
+        let session = client
+            .new_session_from_info((endpoint, identity))
+            .map_err(|e| anyhow!("opc ua session build failed: {e}"))?;
+        {
+            let mut guard = session.write();
+            guard
+                .connect_and_activate()
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
+        }
+        Ok(session)
+    }
+
+    async fn write_values_transient(&self, writes: Vec<WriteValue>) -> Result<()> {
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::info!(
+                "opc ua connect (transient write) endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+
+            let session = OpcUaClient::connect_once(
+                &cfg,
+                "edge_agent_opcua_write",
+                "urn:edge_agent_opcua_write",
+            )?;
+
+            let result = {
+                let session = session.write();
+                session
+                    .write(&writes)
+                    .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
+            };
+
+            match result {
+                Ok(statuses) => {
+                    if !statuses.iter().all(|s| s.is_good()) {
+                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))?
+    }
+
+    async fn read_values_transient(
+        &self,
+        read_ids: Vec<ReadValueId>,
+    ) -> Result<Vec<DataValue>> {
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<DataValue>> {
+            tracing::info!(
+                "opc ua connect (transient read) endpoint={} user={} nodes={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous"),
+                read_ids.len()
+            );
+
+            let session = OpcUaClient::connect_once(
+                &cfg,
+                "edge_agent_opcua_read",
+                "urn:edge_agent_opcua_read",
+            )?;
+
+            let session = session.write();
+            let result = session
+                .read(&read_ids, TimestampsToReturn::Neither, 5_000.0)
+                .map_err(|status| anyhow!("opc ua read failed: {:?}", status));
+            if result.is_ok() {
+                tracing::info!(
+                    "opc ua read ok endpoint={} nodes={}",
+                    cfg.endpoint,
+                    read_ids.len()
+                );
+            }
+            result
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua read join error: {e}"))?
     }
 }
 
