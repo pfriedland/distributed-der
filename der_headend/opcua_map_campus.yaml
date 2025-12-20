@@ -1,10 +1,11 @@
-endpoint: opc.tcp://ignition-edge-campus:62542
+endpoint: opc.tcp://host.containers.internal:62541
 # Default fallback if an asset_id is not explicitly mapped
 default_setpoint: ns=2;s=[edge]/Assets/CT-BESS-A/control/setpoint_mw
 setpoints:
   "7ba7b812-9dad-11d1-80b4-00c04fd430c8": ns=2;s=[edge]/Assets/CT-BESS-A/control/setpoint_mw
   "8ba7b812-9dad-11d1-80b4-00c04fd430c8": ns=2;s=[edge]/Assets/CT-BESS-B/control/setpoint_mw
 telemetry_interval_s: 10
+telemetry_mode: poll
 telemetry_assets:
   "7ba7b812-9dad-11d1-80b4-00c04fd430c8":
     current_mw: ns=2;s=[edge]/Assets/CT-BESS-A/telemetry/current_mw

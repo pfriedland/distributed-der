@@ -15,12 +15,13 @@ use futures_util::StreamExt;
 use opcua::client::prelude::{
     AttributeService,
     AttributeId, ClientBuilder, DataValue, EndpointDescription, IdentityToken, MessageSecurityMode,
-    NodeId, QualifiedName, ReadValueId, SecurityPolicy, Session, TimestampsToReturn, UAString,
-    UserTokenPolicy, Variant, WriteValue,
+    MonitoringMode, MonitoringParameters, MonitoredItemService, NodeId, QualifiedName,
+    ReadValueId, SecurityPolicy, Session, SubscriptionService, TimestampsToReturn, UAString,
+    UserTokenPolicy, Variant, WriteValue, SessionCommand,
 };
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{sync::{RwLock, oneshot}, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -787,6 +788,11 @@ struct OpcUaConfig {
     default_setpoint: Option<NodeId>,
     default_telemetry: TelemetryNodes,
     telemetry_interval: Duration,
+    telemetry_mode: TelemetryMode,
+    startup_delay: Duration,
+    connect_retry_base: Duration,
+    connect_retry_max: Duration,
+    connect_retry_attempts: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -795,6 +801,25 @@ struct TelemetryNodes {
     soc_pct: Option<NodeId>,
     soc_mwhr: Option<NodeId>,
     status: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TelemetryMode {
+    Poll,
+    Subscribe,
+}
+
+impl TelemetryMode {
+    fn from_env() -> Self {
+        Self::from_str(std::env::var("OPCUA_TELEMETRY_MODE").ok().as_deref())
+    }
+
+    fn from_str(input: Option<&str>) -> Self {
+        match input.map(|s| s.to_ascii_lowercase()) {
+            Some(s) if s == "subscribe" || s == "sub" => TelemetryMode::Subscribe,
+            _ => TelemetryMode::Poll,
+        }
+    }
 }
 
 impl TelemetryNodes {
@@ -830,6 +855,16 @@ struct OpcUaConfigFile {
     telemetry_assets: std::collections::HashMap<String, OpcUaTelemetryMap>,
     #[serde(default)]
     telemetry_interval_s: Option<u64>,
+    #[serde(default)]
+    telemetry_mode: Option<String>,
+    #[serde(default)]
+    startup_delay_s: Option<u64>,
+    #[serde(default)]
+    connect_retry_ms: Option<u64>,
+    #[serde(default)]
+    connect_retry_max_ms: Option<u64>,
+    #[serde(default)]
+    connect_retry_attempts: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -887,6 +922,7 @@ impl OpcUaConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_mode = TelemetryMode::from_env();
 
         Ok(Some(Self {
             endpoint,
@@ -898,6 +934,29 @@ impl OpcUaConfig {
             default_setpoint,
             default_telemetry: TelemetryNodes::default(),
             telemetry_interval,
+            telemetry_mode,
+            startup_delay: Duration::from_secs(
+                std::env::var("OPCUA_STARTUP_DELAY_S")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5),
+            ),
+            connect_retry_base: Duration::from_millis(
+                std::env::var("OPCUA_CONNECT_RETRY_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(250),
+            ),
+            connect_retry_max: Duration::from_millis(
+                std::env::var("OPCUA_CONNECT_RETRY_MAX_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5_000),
+            ),
+            connect_retry_attempts: std::env::var("OPCUA_CONNECT_RETRY_ATTEMPTS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(5),
         }))
     }
 
@@ -928,6 +987,7 @@ impl OpcUaConfig {
             .telemetry_interval_s
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_mode = TelemetryMode::from_str(file.telemetry_mode.as_deref());
 
         let mut telemetry_assets = std::collections::HashMap::new();
         for (k, v) in file.telemetry_assets {
@@ -946,6 +1006,11 @@ impl OpcUaConfig {
             default_setpoint,
             default_telemetry,
             telemetry_interval,
+            telemetry_mode,
+            startup_delay: Duration::from_secs(file.startup_delay_s.unwrap_or(5)),
+            connect_retry_base: Duration::from_millis(file.connect_retry_ms.unwrap_or(250)),
+            connect_retry_max: Duration::from_millis(file.connect_retry_max_ms.unwrap_or(5_000)),
+            connect_retry_attempts: file.connect_retry_attempts.unwrap_or(5),
         }))
     }
 
@@ -1327,6 +1392,15 @@ struct OpcUaClient {
     last_telemetry: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
     last_sample: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, OpcUaTelemetrySample>>>,
     session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<opcua::sync::RwLock<Session>>>>>,
+    sub_session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<opcua::sync::RwLock<Session>>>>>,
+    subscription_id: Arc<tokio::sync::Mutex<Option<u32>>>,
+    subscribed_assets: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    node_index: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, (Uuid, OpcUaField)>>>,
+    run_started: Arc<tokio::sync::Mutex<bool>>,
+    run_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<SessionCommand>>>>,
+    sub_run_started: Arc<tokio::sync::Mutex<bool>>,
+    sub_run_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<SessionCommand>>>>,
+    startup_wait_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OpcUaClient {
@@ -1340,6 +1414,19 @@ impl OpcUaClient {
                 std::collections::HashMap::new(),
             )),
             session: Arc::new(tokio::sync::Mutex::new(None)),
+            sub_session: Arc::new(tokio::sync::Mutex::new(None)),
+            subscription_id: Arc::new(tokio::sync::Mutex::new(None)),
+            subscribed_assets: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            node_index: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_started: Arc::new(tokio::sync::Mutex::new(false)),
+            run_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            sub_run_started: Arc::new(tokio::sync::Mutex::new(false)),
+            sub_run_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            startup_wait_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1359,6 +1446,243 @@ impl OpcUaClient {
             || nodes.soc_pct.is_some()
             || nodes.soc_mwhr.is_some()
             || nodes.status.is_some()
+    }
+
+    async fn ensure_subscription_for_asset(&self, asset_id: Uuid) -> Result<()> {
+        if self.cfg.telemetry_mode != TelemetryMode::Subscribe {
+            return Ok(());
+        }
+        if !self.telemetry_enabled_for_asset(asset_id) {
+            return Ok(());
+        }
+
+        // If the subscription session dropped, clear state so we re-subscribe.
+        {
+            let guard = self.sub_session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                let connected = {
+                    let session_guard = session.read();
+                    session_guard.is_connected()
+                };
+                if !connected {
+                    drop(guard);
+                    self.drop_sub_session().await;
+                }
+            }
+        }
+
+        {
+            let subscribed = self.subscribed_assets.lock().await;
+            if subscribed.contains(&asset_id) {
+                return Ok(());
+            }
+        }
+
+        let nodes = self.telemetry_nodes_for_asset(asset_id);
+        let mut items = Vec::new();
+        let mut index_updates = Vec::new();
+
+        if let Some(node) = nodes.current_mw {
+            items.push(node.clone());
+            index_updates.push((node, (asset_id, OpcUaField::CurrentMw)));
+        }
+        if let Some(node) = nodes.soc_pct {
+            items.push(node.clone());
+            index_updates.push((node, (asset_id, OpcUaField::SocPct)));
+        }
+        if let Some(node) = nodes.soc_mwhr {
+            items.push(node.clone());
+            index_updates.push((node, (asset_id, OpcUaField::SocMwhr)));
+        }
+        if let Some(node) = nodes.status {
+            items.push(node.clone());
+            index_updates.push((node, (asset_id, OpcUaField::Status)));
+        }
+
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let session = self.get_or_connect_sub_session().await?;
+        self.ensure_sub_run_loop(session.clone()).await;
+        let last_sample = self.last_sample.clone();
+        let node_index = self.node_index.clone();
+        let subscription_id = self.subscription_id.clone();
+        let subscribed_assets = self.subscribed_assets.clone();
+        let interval_ms = self.cfg.telemetry_interval.as_millis().max(1000) as f64;
+        let max_keep_alive = 10;
+        let lifetime_count = max_keep_alive * 3;
+
+        let setup_result = tokio::task::spawn_blocking(move || -> Result<()> {
+            {
+                let mut map = node_index.blocking_lock();
+                for (node, mapping) in index_updates {
+                    map.insert(node, mapping);
+                }
+            }
+
+            let sub_id = {
+                let mut guard = subscription_id.blocking_lock();
+                if let Some(id) = *guard {
+                    id
+                } else {
+                    let session = session.write();
+                    let id = session
+                        .create_subscription(
+                            interval_ms,
+                            lifetime_count,
+                            max_keep_alive,
+                            0,
+                            0,
+                            true,
+                            opcua::client::prelude::DataChangeCallback::new(move |items| {
+                                let Ok(map) = node_index.try_lock() else {
+                                    return;
+                                };
+                                let Ok(mut cache) = last_sample.try_lock() else {
+                                    return;
+                                };
+                                for item in items {
+                                    let node_id = &item.item_to_monitor().node_id;
+                                    let Some((asset_id, field)) = map.get(node_id) else {
+                                        continue;
+                                    };
+                                    let dv = item.last_value();
+                                    let value = dv.value.as_ref();
+                                    let sample = cache.entry(*asset_id).or_default();
+                                    match field {
+                                        OpcUaField::CurrentMw => {
+                                            sample.current_mw = value.and_then(variant_to_f64)
+                                        }
+                                        OpcUaField::SocPct => {
+                                            sample.soc_pct = value.and_then(variant_to_f64)
+                                        }
+                                        OpcUaField::SocMwhr => {
+                                            sample.soc_mwhr = value.and_then(variant_to_f64)
+                                        }
+                                        OpcUaField::Status => {
+                                            sample.status = value.and_then(variant_to_string)
+                                        }
+                                    }
+                                    tracing::info!(
+                                        "opc ua subscription update asset_id={} field={:?} value={:?}",
+                                        asset_id,
+                                        field,
+                                        value
+                                    );
+                                }
+                            }),
+                        )
+                        .map_err(|e| anyhow!("opc ua subscribe failed: {:?}", e))?;
+                    *guard = Some(id);
+                    id
+                }
+            };
+
+            let session = session.write();
+            let items_to_create: Vec<opcua::types::MonitoredItemCreateRequest> = items
+                .into_iter()
+                .map(|node| opcua::types::MonitoredItemCreateRequest {
+                    item_to_monitor: ReadValueId {
+                        node_id: node,
+                        attribute_id: AttributeId::Value as u32,
+                        index_range: UAString::null(),
+                        data_encoding: QualifiedName::null(),
+                    },
+                    monitoring_mode: MonitoringMode::Reporting,
+                    requested_parameters: MonitoringParameters {
+                        client_handle: 0,
+                        sampling_interval: interval_ms,
+                        filter: opcua::types::ExtensionObject::null(),
+                        queue_size: 10,
+                        discard_oldest: true,
+                    },
+                })
+                .collect();
+            let _ = session
+                .create_monitored_items(sub_id, TimestampsToReturn::Both, &items_to_create)
+                .map_err(|e| anyhow!("opc ua create monitored items failed: {:?}", e))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua subscribe join error: {e}"))?;
+
+        setup_result?;
+
+        {
+            let mut subs = subscribed_assets.lock().await;
+            subs.insert(asset_id);
+        }
+
+        Ok(())
+    }
+
+    fn connect_with_retry(
+        cfg: &OpcUaConfig,
+        app_name: &str,
+        app_uri: &str,
+        startup_wait_done: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        if !startup_wait_done.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && cfg.startup_delay > Duration::from_secs(0)
+        {
+            std::thread::sleep(cfg.startup_delay);
+        }
+
+        let mut backoff = cfg.connect_retry_base;
+        let mut last_err = None;
+        for attempt in 0..=cfg.connect_retry_attempts {
+            let mut client = ClientBuilder::new()
+                .application_name(app_name)
+                .application_uri(app_uri)
+                .trust_server_certs(true)
+                .create_sample_keypair(true)
+                .session_retry_limit(0)
+                .client()
+                .ok_or_else(|| anyhow!("opc ua client build failed"))?;
+
+            let endpoint: EndpointDescription = (
+                cfg.endpoint.as_str(),
+                SecurityPolicy::None.to_str(),
+                MessageSecurityMode::None,
+                UserTokenPolicy::anonymous(),
+            )
+                .into();
+
+            let identity = match (cfg.username.clone(), cfg.password.clone()) {
+                (Some(u), Some(p)) => IdentityToken::UserName(u, p),
+                _ => IdentityToken::Anonymous,
+            };
+
+            let session = client
+                .new_session_from_info((endpoint, identity))
+                .map_err(|e| anyhow!("opc ua session build failed: {e}"))?;
+            {
+                let mut session_guard = session.write();
+                match session_guard.connect_and_activate() {
+                    Ok(()) => {}
+                    Err(err) => {
+                        last_err = Some(err);
+                        continue;
+                    }
+                }
+            }
+            return Ok(session);
+
+            if attempt >= cfg.connect_retry_attempts {
+                break;
+            }
+            if backoff > Duration::from_secs(0) {
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff.saturating_mul(2), cfg.connect_retry_max);
+            }
+        }
+
+        Err(anyhow!(
+            "opc ua connect failed: {:?}",
+            last_err.unwrap_or(opcua::types::StatusCode::BadConnectionClosed)
+        ))
     }
 
     async fn write_setpoint(&self, asset_id: Uuid, mw: f64) -> Result<()> {
@@ -1388,7 +1712,7 @@ impl OpcUaClient {
             attribute_id: AttributeId::Value as u32,
             index_range: UAString::null(),
             value: DataValue {
-                value: Some(Variant::Double(mw)),
+                value: Some(Variant::Float(mw as f32)),
                 status: None,
                 source_timestamp: None,
                 source_picoseconds: None,
@@ -1402,6 +1726,12 @@ impl OpcUaClient {
     async fn read_telemetry(&self, asset_id: Uuid) -> Result<Option<OpcUaTelemetrySample>> {
         if !self.telemetry_enabled_for_asset(asset_id) {
             return Ok(None);
+        }
+
+        if self.cfg.telemetry_mode == TelemetryMode::Subscribe {
+            self.ensure_subscription_for_asset(asset_id).await?;
+            let cache = self.last_sample.lock().await;
+            return Ok(cache.get(&asset_id).cloned());
         }
 
         if self.cfg.telemetry_interval > Duration::from_secs(0) {
@@ -1463,17 +1793,7 @@ impl OpcUaClient {
             return Ok(None);
         }
 
-        let session = self.get_or_connect_session().await?;
-        let values = tokio::task::spawn_blocking(move || -> Result<Vec<DataValue>> {
-            let session = session.write();
-            session
-                .read(&read_ids, TimestampsToReturn::Neither, 5_000.0)
-                .map_err(|status| anyhow!("opc ua read failed: {:?}", status))
-        })
-        .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
-
-        let values = match values {
+        let values = match self.read_values_transient(read_ids).await {
             Ok(values) => values,
             Err(err) => {
                 let cache = self.last_sample.lock().await;
@@ -1508,31 +1828,135 @@ impl OpcUaClient {
     }
 
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
-        let session = self.get_or_connect_session().await?;
-        let writes_clone = writes.clone();
-        let write_result = tokio::task::spawn_blocking(move || -> Result<Vec<opcua::types::StatusCode>> {
-            let session = session.write();
-            session
-                .write(&writes_clone)
-                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
-        })
-        .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
+        tracing::info!("opc ua write path=transient");
+        self.write_values_split(writes).await
+    }
 
-        match write_result {
-            Ok(statuses) => {
-                if !statuses.iter().all(|s| s.is_good()) {
-                    self.drop_session().await;
-                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
-                }
-            }
-            Err(err) => {
-                self.drop_session().await;
-                return Err(err);
+    async fn write_values_split(&self, writes: Vec<WriteValue>) -> Result<()> {
+        tracing::info!("opc ua write path=split_transient count={}", writes.len());
+        for write in writes {
+            let node = write.node_id.clone();
+            if let Err(err) = self.write_values_transient(vec![write]).await {
+                return Err(anyhow!("opc ua split write failed node={node:?}: {err}"));
             }
         }
-
         Ok(())
+    }
+
+    async fn write_values_transient(&self, writes: Vec<WriteValue>) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let startup_wait_done = self.startup_wait_done.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::info!(
+                "opc ua connect (transient) endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+
+            let session = OpcUaClient::connect_with_retry(
+                &cfg,
+                "edge_agent_opcua",
+                "urn:edge_agent_opcua",
+                &startup_wait_done,
+            )?;
+
+            let mut last_err = None;
+            for attempt in 0..3u32 {
+                let result = {
+                    let session = session.write();
+                    session
+                        .write(&writes)
+                        .map_err(|status| {
+                            tracing::warn!(
+                                "opc ua write failed: status={:?} base={:?} flags={:?}",
+                                status,
+                                status.status(),
+                                status.bitflags()
+                            );
+                            anyhow!("opc ua write failed: {:?}", status)
+                        })
+                };
+
+                match result {
+                    Ok(statuses) => {
+                        if !statuses.iter().all(|s| s.is_good()) {
+                            for (idx, status) in statuses.iter().enumerate() {
+                                if !status.is_good() {
+                                    let node = writes.get(idx).map(|w| w.node_id.clone());
+                                tracing::warn!(
+                                    "opc ua write bad status: node={node:?} status={status:?} base={:?} flags={:?}",
+                                    status.status(),
+                                    status.bitflags(),
+                                );
+                            }
+                        }
+                        let retryable = statuses.iter().any(|s| {
+                            let base = s.status();
+                            base == opcua::types::StatusCode::BadEncodingLimitsExceeded
+                                    || base == opcua::types::StatusCode::BadTcpMessageTooLarge
+                                    || base == opcua::types::StatusCode::BadResourceUnavailable
+                            });
+                            if retryable && attempt < 2 {
+                                tracing::warn!(
+                                    "opc ua write size error; retrying transient attempt={}",
+                                    attempt + 1
+                                );
+                                std::thread::sleep(Duration::from_millis(200));
+                                continue;
+                            }
+                            return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        if attempt < 2 {
+                            std::thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow!("opc ua write failed: unknown error")))
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))?
+    }
+
+    async fn read_values_transient(
+        &self,
+        read_ids: Vec<ReadValueId>,
+    ) -> Result<Vec<DataValue>> {
+        let cfg = self.cfg.clone();
+        let startup_wait_done = self.startup_wait_done.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<DataValue>> {
+            tracing::info!(
+                "opc ua connect (transient read) endpoint={} user={} nodes={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous"),
+                read_ids.len()
+            );
+            let session = OpcUaClient::connect_with_retry(
+                &cfg,
+                "edge_agent_opcua_read",
+                "urn:edge_agent_opcua_read",
+                &startup_wait_done,
+            )?;
+            let session = session.write();
+            let result = session
+                .read(&read_ids, TimestampsToReturn::Neither, 5_000.0)
+                .map_err(|status| anyhow!("opc ua read failed: {:?}", status));
+            if result.is_ok() {
+                tracing::info!(
+                    "opc ua read ok endpoint={} nodes={}",
+                    cfg.endpoint,
+                    read_ids.len()
+                );
+            }
+            result
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua read join error: {e}"))?
     }
 
     async fn get_or_connect_session(
@@ -1541,55 +1965,144 @@ impl OpcUaClient {
         {
             let guard = self.session.lock().await;
             if let Some(session) = guard.as_ref() {
-                return Ok(session.clone());
+                let is_connected = {
+                    let session_guard = session.read();
+                    session_guard.is_connected()
+                };
+                if is_connected {
+                    return Ok(session.clone());
+                }
             }
         }
 
         let cfg = self.cfg.clone();
+        let startup_wait_done = self.startup_wait_done.clone();
         let session = tokio::task::spawn_blocking(move || -> Result<_> {
             tracing::info!(
                 "opc ua connect endpoint={} user={}",
                 cfg.endpoint,
                 cfg.username.as_deref().unwrap_or("anonymous")
             );
-
-            let mut client = ClientBuilder::new()
-                .application_name("edge_agent_opcua")
-                .application_uri("urn:edge_agent_opcua")
-                .trust_server_certs(true)
-                .create_sample_keypair(true)
-                .session_retry_limit(5)
-                .client()
-                .ok_or_else(|| anyhow!("opc ua client build failed"))?;
-
-            let endpoint: EndpointDescription = (
-                cfg.endpoint.as_str(),
-                SecurityPolicy::None.to_str(),
-                MessageSecurityMode::None,
-                UserTokenPolicy::anonymous(),
+            OpcUaClient::connect_with_retry(
+                &cfg,
+                "edge_agent_opcua",
+                "urn:edge_agent_opcua",
+                &startup_wait_done,
             )
-                .into();
-
-            let identity = match (cfg.username.clone(), cfg.password.clone()) {
-                (Some(u), Some(p)) => IdentityToken::UserName(u, p),
-                _ => IdentityToken::Anonymous,
-            };
-
-            client
-                .connect_to_endpoint(endpoint, identity)
-                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))
         })
         .await
         .map_err(|e| anyhow!("opc ua task join error: {e}"))??;
 
         let mut guard = self.session.lock().await;
         *guard = Some(session.clone());
+        self.ensure_run_loop(session.clone()).await;
         Ok(session)
     }
 
+    async fn get_or_connect_sub_session(
+        &self,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        {
+            let guard = self.sub_session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                let is_connected = {
+                    let session_guard = session.read();
+                    session_guard.is_connected()
+                };
+                if is_connected {
+                    return Ok(session.clone());
+                }
+            }
+        }
+        self.drop_sub_session().await;
+
+        let cfg = self.cfg.clone();
+        let startup_wait_done = self.startup_wait_done.clone();
+        let session = tokio::task::spawn_blocking(move || -> Result<_> {
+            tracing::info!(
+                "opc ua connect (sub) endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+            OpcUaClient::connect_with_retry(
+                &cfg,
+                "edge_agent_opcua_sub",
+                "urn:edge_agent_opcua_sub",
+                &startup_wait_done,
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))??;
+
+        let mut guard = self.sub_session.lock().await;
+        *guard = Some(session.clone());
+        self.ensure_sub_run_loop(session.clone()).await;
+        Ok(session)
+    }
+
+    async fn ensure_run_loop(
+        &self,
+        session: std::sync::Arc<opcua::sync::RwLock<Session>>,
+    ) {
+        let mut started = self.run_started.lock().await;
+        if *started {
+            return;
+        }
+        *started = true;
+        let (tx, rx) = oneshot::channel();
+        let mut run_tx = self.run_tx.lock().await;
+        *run_tx = Some(tx);
+        tokio::spawn(async move {
+            Session::session_task(session, 10, rx).await;
+        });
+    }
+
+    async fn ensure_sub_run_loop(
+        &self,
+        session: std::sync::Arc<opcua::sync::RwLock<Session>>,
+    ) {
+        let mut started = self.sub_run_started.lock().await;
+        if *started {
+            return;
+        }
+        *started = true;
+        let (tx, rx) = oneshot::channel();
+        let mut run_tx = self.sub_run_tx.lock().await;
+        *run_tx = Some(tx);
+        tokio::spawn(async move {
+            Session::session_task(session, 10, rx).await;
+        });
+    }
+
     async fn drop_session(&self) {
-        let mut guard = self.session.lock().await;
-        *guard = None;
+        let session = {
+            let mut guard = self.session.lock().await;
+            guard.take()
+        };
+        *self.subscription_id.lock().await = None;
+        self.subscribed_assets.lock().await.clear();
+        self.node_index.lock().await.clear();
+        *self.run_tx.lock().await = None;
+        *self.run_started.lock().await = false;
+        if let Some(session) = session {
+            tokio::task::spawn_blocking(move || drop(session));
+        }
+        self.drop_sub_session().await;
+    }
+
+    async fn drop_sub_session(&self) {
+        let session = {
+            let mut sub_guard = self.sub_session.lock().await;
+            sub_guard.take()
+        };
+        *self.subscription_id.lock().await = None;
+        self.subscribed_assets.lock().await.clear();
+        self.node_index.lock().await.clear();
+        *self.sub_run_tx.lock().await = None;
+        *self.sub_run_started.lock().await = false;
+        if let Some(session) = session {
+            tokio::task::spawn_blocking(move || drop(session));
+        }
     }
 }
 

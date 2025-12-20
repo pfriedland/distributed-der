@@ -1,4 +1,5 @@
 FROM rustlang/rust:nightly AS builder
+ARG PROFILE=release
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,7 +25,15 @@ COPY agent_launcher/src agent_launcher/src
 ENV CARGO_BUILD_JOBS=1
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
-RUN cargo build -p edge_agent --release
+RUN if [ "$PROFILE" = "debug" ]; then \
+      cargo build -p edge_agent; \
+      mkdir -p /app/out; \
+      cp /app/target/debug/edge_agent /app/out/edge_agent; \
+    else \
+      cargo build -p edge_agent --release; \
+      mkdir -p /app/out; \
+      cp /app/target/release/edge_agent /app/out/edge_agent; \
+    fi
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,6 +41,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/edge_agent /usr/local/bin/edge_agent
+COPY --from=builder /app/out/edge_agent /usr/local/bin/edge_agent
 
 ENTRYPOINT ["/usr/local/bin/edge_agent"]
