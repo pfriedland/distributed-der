@@ -1314,7 +1314,7 @@ impl OpcUaClient {
             attribute_id: AttributeId::Value as u32,
             index_range: UAString::null(),
             value: DataValue {
-                value: Some(Variant::Double(mw)),
+                value: Some(Variant::Float(mw as f32)),
                 status: None,
                 source_timestamp: None,
                 source_picoseconds: None,
@@ -1411,87 +1411,92 @@ impl OpcUaClient {
     }
 
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
-        let session = self.get_or_connect_session().await?;
-        let writes_clone = writes.clone();
-        let write_result = tokio::task::spawn_blocking(move || -> Result<Vec<opcua::types::StatusCode>> {
-            let session = session.write();
-            session
-                .write(&writes_clone)
-                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
-        })
-        .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))?;
-
-        match write_result {
-            Ok(statuses) => {
-                if !statuses.iter().all(|s| s.is_good()) {
-                    self.drop_session().await;
-                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
-                }
-            }
-            Err(err) => {
-                self.drop_session().await;
-                return Err(err);
-            }
-        }
-
-        Ok(())
+        self.write_values_transient(writes).await
     }
 
-    async fn get_or_connect_session(
-        &self,
+    fn connect_once(
+        cfg: &OpcUaConfig,
+        app_name: &str,
+        app_uri: &str,
     ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
-        {
-            let guard = self.session.lock().await;
-            if let Some(session) = guard.as_ref() {
-                return Ok(session.clone());
-            }
-        }
+        let mut client = ClientBuilder::new()
+            .application_name(app_name)
+            .application_uri(app_uri)
+            .trust_server_certs(true)
+            .create_sample_keypair(true)
+            .session_retry_limit(0)
+            .client()
+            .ok_or_else(|| anyhow!("opc ua client build failed"))?;
 
+        let endpoint: EndpointDescription = (
+            cfg.endpoint.as_str(),
+            SecurityPolicy::None.to_str(),
+            MessageSecurityMode::None,
+            UserTokenPolicy::anonymous(),
+        )
+            .into();
+
+        let identity = match (cfg.username.clone(), cfg.password.clone()) {
+            (Some(u), Some(p)) => IdentityToken::UserName(u, p),
+            _ => IdentityToken::Anonymous,
+        };
+
+        let session = client
+            .new_session_from_info((endpoint, identity))
+            .map_err(|e| anyhow!("opc ua session build failed: {e}"))?;
+        {
+            let mut guard = session.write();
+            guard
+                .connect_and_activate()
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
+        }
+        Ok(session)
+    }
+
+    async fn write_values_transient(&self, writes: Vec<WriteValue>) -> Result<()> {
         let cfg = self.cfg.clone();
-        let session = tokio::task::spawn_blocking(move || -> Result<_> {
+        tokio::task::spawn_blocking(move || -> Result<()> {
             tracing::info!(
-                "opc ua connect endpoint={} user={}",
+                "opc ua connect (transient write) endpoint={} user={}",
                 cfg.endpoint,
                 cfg.username.as_deref().unwrap_or("anonymous")
             );
 
-            let mut client = ClientBuilder::new()
-                .application_name("edge_agent_opcua")
-                .application_uri("urn:edge_agent_opcua")
-                .trust_server_certs(true)
-                .create_sample_keypair(true)
-                .session_retry_limit(5)
-                .client()
-                .ok_or_else(|| anyhow!("opc ua client build failed"))?;
+            let session = OpcUaClient::connect_once(
+                &cfg,
+                "edge_agent_opcua_write",
+                "urn:edge_agent_opcua_write",
+            )?;
 
-            let endpoint: EndpointDescription = (
-                cfg.endpoint.as_str(),
-                SecurityPolicy::None.to_str(),
-                MessageSecurityMode::None,
-                UserTokenPolicy::anonymous(),
-            )
-                .into();
-
-            let identity = match (cfg.username.clone(), cfg.password.clone()) {
-                (Some(u), Some(p)) => IdentityToken::UserName(u, p),
-                _ => IdentityToken::Anonymous,
+            let result = {
+                let session = session.write();
+                session
+                    .write(&writes)
+                    .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
             };
 
-            client
-                .connect_to_endpoint(endpoint, identity)
-                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))
+            match result {
+                Ok(statuses) => {
+                    if !statuses.iter().all(|s| s.is_good()) {
+                        for (idx, status) in statuses.iter().enumerate() {
+                            if !status.is_good() {
+                                let node = writes.get(idx).map(|w| w.node_id.clone());
+                                tracing::warn!(
+                                    "opc ua write bad status: node={node:?} status={status:?} base={:?} flags={:?}",
+                                    status.status(),
+                                    status.bitflags()
+                                );
+                            }
+                        }
+                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+
+            Ok(())
         })
         .await
-        .map_err(|e| anyhow!("opc ua task join error: {e}"))??;
-
-        let mut guard = self.session.lock().await;
-        *guard = Some(session.clone());
-        Ok(session)
-    }
-
-    async fn drop_session(&self) {
-        let mut guard = self.session.lock().await;
-        *guard = None;
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))?
     }
 }
