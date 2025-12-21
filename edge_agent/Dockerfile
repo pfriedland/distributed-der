@@ -23,7 +23,7 @@ COPY agent_launcher/src agent_launcher/src
 
 ENV CARGO_BUILD_JOBS=1
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-
+ENV RUST_LOG=info,opcua::client::session=warn,opcua::client::session::session=warn,opcua::client::session::session_state=warn,opcua::client::comms=warn
 RUN cargo build -p edge_agent --release
 
 FROM debian:bookworm-slim
