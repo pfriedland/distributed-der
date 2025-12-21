@@ -2204,9 +2204,43 @@ async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn list_assets(State(state): State<AppState>) -> Json<Vec<Asset>> {
+async fn list_assets(State(state): State<AppState>) -> Json<Vec<AssetView>> {
     let sim = state.sim.read().await;
-    Json(sim.assets())
+    let mut latest = state.latest.read().await.clone();
+    for (id, asset) in sim.assets.iter() {
+        if latest.contains_key(id) {
+            continue;
+        }
+        if let Some(st) = sim.state.get(id) {
+            let mut tmp_state = st.clone();
+            let snap = tick_asset(asset, &mut tmp_state, 0.0);
+            latest.insert(*id, snap);
+        }
+    }
+    let mut rows = Vec::new();
+    for asset in sim.assets.values() {
+        let telemetry = latest.get(&asset.id);
+        rows.push(AssetView {
+            id: asset.id,
+            site_id: asset.site_id,
+            site_name: asset.site_name.clone(),
+            name: asset.name.clone(),
+            location: asset.location.clone(),
+            capacity_mwhr: asset.capacity_mwhr,
+            max_mw: asset.max_mw,
+            min_mw: asset.min_mw,
+            min_soc_pct: asset.min_soc_pct,
+            max_soc_pct: asset.max_soc_pct,
+            efficiency: asset.efficiency,
+            ramp_rate_mw_per_min: asset.ramp_rate_mw_per_min,
+            soc_pct: telemetry.map(|t| t.soc_pct),
+            soc_mwhr: telemetry.map(|t| t.soc_mwhr),
+            status: telemetry.map(|t| t.status.clone()),
+            current_mw: telemetry.map(|t| t.current_mw),
+            setpoint_mw: telemetry.map(|t| t.setpoint_mw),
+        });
+    }
+    Json(rows)
 }
 
 async fn latest_telemetry(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
@@ -2286,6 +2320,27 @@ struct HeartbeatRow {
     ts: DateTime<Utc>,
     asset_name: String,
     site_name: String,
+}
+
+#[derive(Serialize)]
+struct AssetView {
+    id: Uuid,
+    site_id: Uuid,
+    site_name: String,
+    name: String,
+    location: String,
+    capacity_mwhr: f64,
+    max_mw: f64,
+    min_mw: f64,
+    min_soc_pct: f64,
+    max_soc_pct: f64,
+    efficiency: f64,
+    ramp_rate_mw_per_min: f64,
+    soc_pct: Option<f64>,
+    soc_mwhr: Option<f64>,
+    status: Option<String>,
+    current_mw: Option<f64>,
+    setpoint_mw: Option<f64>,
 }
 
 async fn history_telemetry(
