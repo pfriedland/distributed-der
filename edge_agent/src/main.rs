@@ -29,9 +29,11 @@ pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    AgentToHeadend, AssetDescriptor, DispatchAck, Event as ProtoEvent, Heartbeat, Register,
-    Setpoint, agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent,
+    AgentToHeadend, AssetDescriptor, BootstrapRequest, BootstrapResponse, DispatchAck,
+    Event as ProtoEvent, Heartbeat, Register, Setpoint, agent_link_client::AgentLinkClient,
+    agent_to_headend, headend_to_agent,
 };
+use tonic::transport::Channel;
 
 #[derive(Clone)]
 struct AppState {
@@ -81,6 +83,9 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
     loop {
         match AgentLinkClient::connect(state.headend_grpc.clone()).await {
             Ok(mut client) => {
+                if let Err(err) = bootstrap_from_headend(&state, &mut client).await {
+                    tracing::warn!("bootstrap failed: {err}");
+                }
                 // Channel to send outbound messages to headend.
                 let (tx, rx) = tokio::sync::mpsc::channel::<AgentToHeadend>(32);
                 let outbound = ReceiverStream::new(rx);
@@ -250,6 +255,78 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
         // Backoff before reconnecting.
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn bootstrap_from_headend(
+    state: &AppState,
+    client: &mut AgentLinkClient<Channel>,
+) -> Result<()> {
+    let asset_ids: Vec<String> = {
+        let assets = state.assets.read().await;
+        let mut ids: Vec<String> = assets.keys().map(|id| id.to_string()).collect();
+        ids.sort();
+        ids
+    };
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let resp = client
+        .bootstrap(BootstrapRequest { asset_ids })
+        .await
+        .map_err(|e| anyhow!("bootstrap rpc failed: {e:?}"))?;
+    apply_bootstrap(state, resp.into_inner()).await?;
+    Ok(())
+}
+
+async fn apply_bootstrap(state: &AppState, resp: BootstrapResponse) -> Result<()> {
+    for entry in resp.assets {
+        let asset_id = match Uuid::parse_str(&entry.asset_id) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!("bootstrap asset_id parse failed asset_id={} err={err}", entry.asset_id);
+                continue;
+            }
+        };
+        let runtime = {
+            let assets = state.assets.read().await;
+            assets.get(&asset_id).cloned()
+        };
+        let Some(rt) = runtime else {
+            tracing::warn!("bootstrap asset not found asset_id={}", asset_id);
+            continue;
+        };
+        let mut desired_setpoint = None;
+        if let Some(sp) = entry.setpoint.as_ref() {
+            desired_setpoint = Some(sp.mw);
+        } else if let Some(t) = entry.telemetry.as_ref() {
+            desired_setpoint = Some(t.setpoint_mw);
+        }
+        if let Some(t) = entry.telemetry {
+            let mut sim = rt.sim.write().await;
+            sim.soc_mwhr = t.soc_mwhr;
+            sim.current_mw = t.current_mw;
+            if let Some(mw) = desired_setpoint {
+                sim.setpoint_mw = mw;
+            }
+            drop(sim);
+            let (min_soc, max_soc) = soc_bounds(&rt.asset);
+            let eps = 1e-6;
+            let next = if t.soc_mwhr <= min_soc + eps {
+                SocState::BelowMin
+            } else if t.soc_mwhr >= max_soc - eps {
+                SocState::AboveMax
+            } else {
+                SocState::InRange
+            };
+            let mut soc_state = rt.soc_state.write().await;
+            *soc_state = next;
+        } else if let Some(mw) = desired_setpoint {
+            let mut sim = rt.sim.write().await;
+            sim.setpoint_mw = mw;
+        }
+        tracing::info!("bootstrap applied asset_id={}", asset_id);
+    }
+    Ok(())
 }
 
 fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {

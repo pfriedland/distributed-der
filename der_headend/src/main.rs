@@ -25,7 +25,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -40,7 +40,8 @@ pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    AgentToHeadend, DispatchAck, Event as ProtoEvent, HeadendToAgent, Register, Setpoint,
+    AgentToHeadend, AssetBootstrap, BootstrapRequest, BootstrapResponse, DispatchAck,
+    Event as ProtoEvent, HeadendToAgent, Register, Setpoint,
     agent_link_server::{AgentLink, AgentLinkServer},
     agent_to_headend, headend_to_agent,
 };
@@ -509,6 +510,29 @@ impl AgentLink for GrpcApi {
     type StreamStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<HeadendToAgent, Status>> + Send>>;
 
+    async fn bootstrap(
+        &self,
+        request: Request<BootstrapRequest>,
+    ) -> Result<GrpcResponse<BootstrapResponse>, Status> {
+        let req = request.into_inner();
+        let mut asset_ids = Vec::new();
+        for id in req.asset_ids {
+            match Uuid::parse_str(&id) {
+                Ok(uuid) => asset_ids.push(uuid),
+                Err(_) => {
+                    return Err(Status::invalid_argument(format!(
+                        "invalid asset_id {}",
+                        id
+                    )));
+                }
+            }
+        }
+        let resp = build_bootstrap_response(&self.state, &asset_ids)
+            .await
+            .map_err(|e| Status::internal(format!("bootstrap failed: {e}")))?;
+        Ok(GrpcResponse::new(resp))
+    }
+
     async fn stream(
         &self,
         request: Request<tonic::Streaming<AgentToHeadend>>,
@@ -777,6 +801,203 @@ async fn handle_agent_telemetry(state: &AppState, t: proto::Telemetry) -> Result
     }
 
     Ok(())
+}
+
+fn telemetry_to_proto(snap: &Telemetry) -> proto::Telemetry {
+    proto::Telemetry {
+        asset_id: snap.asset_id.to_string(),
+        site_id: snap.site_id.to_string(),
+        site_name: snap.site_name.clone(),
+        timestamp: snap
+            .timestamp
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        soc_mwhr: snap.soc_mwhr,
+        soc_pct: snap.soc_pct,
+        capacity_mwhr: snap.capacity_mwhr,
+        current_mw: snap.current_mw,
+        setpoint_mw: snap.setpoint_mw,
+        max_mw: snap.max_mw,
+        min_mw: snap.min_mw,
+        status: snap.status.clone(),
+    }
+}
+
+fn setpoint_from_dispatch(dispatch: &Dispatch, asset: &Asset) -> Setpoint {
+    Setpoint {
+        asset_id: dispatch.asset_id.to_string(),
+        mw: dispatch.mw,
+        duration_s: dispatch.duration_s.map(|v| v as u64),
+        site_id: Some(asset.site_id.to_string()),
+        group_id: None,
+        dispatch_id: Some(dispatch.id.to_string()),
+    }
+}
+
+fn setpoint_from_state(asset: &Asset, state: &BessState) -> Option<Setpoint> {
+    if state.setpoint_mw.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some(Setpoint {
+        asset_id: asset.id.to_string(),
+        mw: state.setpoint_mw,
+        duration_s: None,
+        site_id: Some(asset.site_id.to_string()),
+        group_id: None,
+        dispatch_id: None,
+    })
+}
+
+async fn build_bootstrap_response(
+    state: &AppState,
+    asset_ids: &[Uuid],
+) -> Result<BootstrapResponse> {
+    let mut telemetry_map: HashMap<Uuid, Telemetry> = HashMap::new();
+    {
+        let latest = state.latest.read().await;
+        for id in asset_ids {
+            if let Some(snap) = latest.get(id) {
+                telemetry_map.insert(*id, snap.clone());
+            }
+        }
+    }
+
+    if let Some(db) = state.db.as_ref() {
+        let missing: Vec<Uuid> = asset_ids
+            .iter()
+            .filter(|id| !telemetry_map.contains_key(id))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let rows = sqlx::query_as::<_, TelemetrySnapshotRow>(
+                r#"
+                SELECT DISTINCT ON (asset_id)
+                    asset_id,
+                    site_id,
+                    site_name,
+                    ts,
+                    soc_mwhr,
+                    soc_pct,
+                    capacity_mwhr,
+                    current_mw,
+                    setpoint_mw,
+                    max_mw,
+                    min_mw,
+                    status
+                FROM telemetry
+                WHERE asset_id = ANY($1)
+                ORDER BY asset_id, ts DESC
+                "#,
+            )
+            .bind(&missing)
+            .fetch_all(db)
+            .await
+            .context("querying latest telemetry for bootstrap")?;
+            for row in rows {
+                telemetry_map.insert(
+                    row.asset_id,
+                    Telemetry {
+                        asset_id: row.asset_id,
+                        site_id: row.site_id,
+                        site_name: row.site_name,
+                        timestamp: row.ts,
+                        soc_mwhr: row.soc_mwhr,
+                        soc_pct: row.soc_pct,
+                        capacity_mwhr: row.capacity_mwhr,
+                        current_mw: row.current_mw,
+                        setpoint_mw: row.setpoint_mw,
+                        max_mw: row.max_mw,
+                        min_mw: row.min_mw,
+                        status: row.status,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut setpoint_map: HashMap<Uuid, Setpoint> = HashMap::new();
+    let sim = state.sim.read().await;
+    for id in asset_ids {
+        if let Some(dispatch) = sim.dispatches.get(id) {
+            if let Some(asset) = sim.assets.get(id) {
+                setpoint_map.insert(*id, setpoint_from_dispatch(dispatch, asset));
+            }
+        }
+    }
+
+    if let Some(db) = state.db.as_ref() {
+        let missing: Vec<Uuid> = asset_ids
+            .iter()
+            .filter(|id| !setpoint_map.contains_key(id))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let rows = sqlx::query_as::<_, DispatchSnapshotRow>(
+                r#"
+                SELECT DISTINCT ON (asset_id)
+                    id,
+                    asset_id,
+                    mw,
+                    duration_s
+                FROM dispatches
+                WHERE asset_id = ANY($1)
+                ORDER BY asset_id, submitted_at DESC
+                "#,
+            )
+            .bind(&missing)
+            .fetch_all(db)
+            .await
+            .context("querying latest dispatches for bootstrap")?;
+            for row in rows {
+                if let Some(asset) = sim.assets.get(&row.asset_id) {
+                    let duration_s = row.duration_s.and_then(|v| u64::try_from(v).ok());
+                    setpoint_map.insert(
+                        row.asset_id,
+                        Setpoint {
+                            asset_id: row.asset_id.to_string(),
+                            mw: row.mw,
+                            duration_s,
+                            site_id: Some(asset.site_id.to_string()),
+                            group_id: None,
+                            dispatch_id: Some(row.id.to_string()),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    for id in asset_ids {
+        if setpoint_map.contains_key(id) {
+            continue;
+        }
+        if let (Some(asset), Some(state)) = (sim.assets.get(id), sim.state.get(id)) {
+            if let Some(sp) = setpoint_from_state(asset, state) {
+                setpoint_map.insert(*id, sp);
+            }
+        }
+    }
+
+    for id in asset_ids {
+        if telemetry_map.contains_key(id) {
+            continue;
+        }
+        if let (Some(asset), Some(st)) = (sim.assets.get(id), sim.state.get(id)) {
+            let mut tmp_state = st.clone();
+            let snap = tick_asset(asset, &mut tmp_state, 0.0);
+            telemetry_map.insert(*id, snap);
+        }
+    }
+
+    let mut assets = Vec::new();
+    for id in asset_ids {
+        assets.push(AssetBootstrap {
+            asset_id: id.to_string(),
+            telemetry: telemetry_map.get(id).map(telemetry_to_proto),
+            setpoint: setpoint_map.get(id).cloned(),
+        });
+    }
+
+    Ok(BootstrapResponse { assets })
 }
 
 async fn handle_agent_heartbeat(state: &AppState, hb: proto::Heartbeat) -> Result<()> {
@@ -2019,6 +2240,30 @@ struct TelemetryRow {
     status: String,
     asset_id: Uuid,
     site_id: Uuid,
+}
+
+#[derive(sqlx::FromRow)]
+struct TelemetrySnapshotRow {
+    asset_id: Uuid,
+    site_id: Uuid,
+    site_name: String,
+    ts: DateTime<Utc>,
+    soc_mwhr: f64,
+    soc_pct: f64,
+    capacity_mwhr: f64,
+    current_mw: f64,
+    setpoint_mw: f64,
+    max_mw: f64,
+    min_mw: f64,
+    status: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct DispatchSnapshotRow {
+    id: Uuid,
+    asset_id: Uuid,
+    mw: f64,
+    duration_s: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

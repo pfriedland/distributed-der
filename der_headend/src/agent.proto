@@ -66,6 +66,20 @@ message Event {
   string message = 7;
 }
 
+message BootstrapRequest {
+  repeated string asset_ids = 1;
+}
+
+message AssetBootstrap {
+  string asset_id = 1;
+  optional Telemetry telemetry = 2;
+  optional Setpoint setpoint = 3;
+}
+
+message BootstrapResponse {
+  repeated AssetBootstrap assets = 1;
+}
+
 message AgentToHeadend {
   oneof msg {
     Register register = 1;
@@ -84,4 +98,5 @@ message HeadendToAgent {
 
 service AgentLink {
   rpc Stream(stream AgentToHeadend) returns (stream HeadendToAgent);
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
 }
