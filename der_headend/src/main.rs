@@ -385,6 +385,7 @@ async fn main() -> Result<()> {
         .route("/", get(ui_home))
         .route("/health", get(health))
         .route("/assets", get(list_assets))
+        .route("/assets/{id}", get(get_asset))
         .route("/agents", get(list_agents))
         .route("/telemetry/{id}", get(latest_telemetry))
         .route("/telemetry/{id}/history", get(history_telemetry))
@@ -2205,6 +2206,18 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn list_assets(State(state): State<AppState>) -> Json<Vec<AssetView>> {
+    Json(build_asset_views(&state).await)
+}
+
+async fn get_asset(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let assets = build_asset_views(&state).await;
+    match assets.into_iter().find(|a| a.id == id) {
+        Some(asset) => Json(asset).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn build_asset_views(state: &AppState) -> Vec<AssetView> {
     let sim = state.sim.read().await;
     let mut latest = state.latest.read().await.clone();
     for (id, asset) in sim.assets.iter() {
@@ -2240,7 +2253,7 @@ async fn list_assets(State(state): State<AppState>) -> Json<Vec<AssetView>> {
             setpoint_mw: telemetry.map(|t| t.setpoint_mw),
         });
     }
-    Json(rows)
+    rows
 }
 
 async fn latest_telemetry(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
