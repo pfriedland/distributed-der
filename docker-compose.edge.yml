@@ -3,7 +3,7 @@ name: integrated_system_edge
 
 services:
   ignition-edge-gateway:
-    image: inductiveautomation/ignition:8.1.42
+    image: inductiveautomation/ignition:latest
     restart: unless-stopped
     environment:
       ACCEPT_IGNITION_EULA: "Y"
@@ -14,10 +14,10 @@ services:
       - "8043:8043"
       - "62541:62541"
     volumes:
-      - ignition-edge-gateway-data:/usr/local/bin/ignition/data:Z
+      - ignition_data_8_3_1:/usr/local/bin/ignition/data:Z
 
   ignition-edge-campus:
-    image: inductiveautomation/ignition:8.1.42
+    image: inductiveautomation/ignition:latest
     restart: unless-stopped
     environment:
       ACCEPT_IGNITION_EULA: "Y"
@@ -28,7 +28,7 @@ services:
       - "8044:8044"
       - "62542:62542"
     volumes:
-      - ignition-edge-campus-data:/usr/local/bin/ignition/data:Z
+      - ignition_data_8_3_1_2:/usr/local/bin/ignition/data:Z
 
   edge_agent_gateway:
     build:
@@ -61,5 +61,7 @@ services:
       - ./der_headend/opcua_map_campus.yaml:/config/opcua_map_campus.yaml:ro,Z
 
 volumes:
-  ignition-edge-gateway-data:
-  ignition-edge-campus-data:
+#  ignition-edge-gateway-data:
+#  ignition-edge-campus-data:
+  ignition_data_8_3_1:
+  ignition_data_8_3_1_2:

@@ -122,7 +122,11 @@ impl Simulator {
         self.assets.values().cloned().collect()
     }
 
-    fn set_dispatch(&mut self, req: DispatchRequest) -> Result<Dispatch, anyhow::Error> {
+    fn set_dispatch(
+        &mut self,
+        req: DispatchRequest,
+        soc_mwhr_override: Option<f64>,
+    ) -> Result<Dispatch, anyhow::Error> {
         // Validate the asset exists.
         let asset = self
             .assets
@@ -132,10 +136,11 @@ impl Simulator {
         if let Some(state) = self.state.get(&req.asset_id) {
             let (min_soc, max_soc) = soc_bounds(asset);
             let eps = 1e-6;
-            if req.mw > 0.0 && state.soc_mwhr <= min_soc + eps {
+            let soc_mwhr = soc_mwhr_override.unwrap_or(state.soc_mwhr);
+            if req.mw > 0.0 && soc_mwhr <= min_soc + eps {
                 anyhow::bail!("dispatch rejected: at min SOC");
             }
-            if req.mw < 0.0 && state.soc_mwhr >= max_soc - eps {
+            if req.mw < 0.0 && soc_mwhr >= max_soc - eps {
                 anyhow::bail!("dispatch rejected: at max SOC");
             }
         }
@@ -1496,6 +1501,7 @@ async fn ui_home() -> Html<&'static str> {
         <label>MW <input id="mw" type="number" step="0.1" value="5" style="width: 120px;" /></label>
         <label>Duration (s) <input id="duration_s" type="number" step="1" placeholder="optional" style="width: 140px;" /></label>
         <button id="dispatch_btn">Send dispatch</button>
+        <button id="copy_dispatch_curl" class="small">Copy curl</button>
         <span id="dispatch_status" class="pill ok" style="display:none;"></span>
       </div>
 
@@ -1731,6 +1737,36 @@ async fn ui_home() -> Html<&'static str> {
 
   function dispatchMode() {
     return document.querySelector('input[name="dispatch_mode"]:checked').value;
+  }
+
+  function buildDispatchPayload() {
+    const mode = dispatchMode();
+    const mw = Number($('mw').value);
+    const durRaw = $('duration_s').value;
+    const duration_s = durRaw === '' ? null : Number(durRaw);
+
+    if (!Number.isFinite(mw)) return { error: 'MW must be a number' };
+
+    const payload = { mw };
+    if (duration_s != null && Number.isFinite(duration_s)) payload.duration_s = duration_s;
+
+    if (mode === 'asset') {
+      const asset_id = $('asset_select').value;
+      if (!asset_id) return { error: 'Select an asset' };
+      payload.asset_id = asset_id;
+    } else {
+      const site_id = $('site_select').value;
+      if (!site_id) return { error: 'Select a site' };
+      payload.site_id = site_id;
+    }
+
+    return { payload };
+  }
+
+  function buildDispatchCurl(payload) {
+    const url = `${window.location.origin}/dispatch`;
+    const body = JSON.stringify(payload);
+    return `curl -sS -X POST '${url}' -H 'content-type: application/json' -d '${body}'`;
   }
 
   function rebuildSelectors() {
@@ -2068,27 +2104,10 @@ async fn ui_home() -> Html<&'static str> {
   }
 
   async function sendDispatch() {
-    const mode = dispatchMode();
-    const mw = Number($('mw').value);
-    const durRaw = $('duration_s').value;
-    const duration_s = durRaw === '' ? null : Number(durRaw);
-
-    if (!Number.isFinite(mw)) {
-      setStatus(false, 'MW must be a number');
+    const { payload, error } = buildDispatchPayload();
+    if (error) {
+      setStatus(false, error);
       return;
-    }
-
-    const payload = { mw };
-    if (duration_s != null && Number.isFinite(duration_s)) payload.duration_s = duration_s;
-
-    if (mode === 'asset') {
-      const asset_id = $('asset_select').value;
-      if (!asset_id) { setStatus(false, 'Select an asset'); return; }
-      payload.asset_id = asset_id;
-    } else {
-      const site_id = $('site_select').value;
-      if (!site_id) { setStatus(false, 'Select a site'); return; }
-      payload.site_id = site_id;
     }
 
     try {
@@ -2125,6 +2144,21 @@ async fn ui_home() -> Html<&'static str> {
     }
 
     $('dispatch_btn').addEventListener('click', () => sendDispatch());
+    $('copy_dispatch_curl').addEventListener('click', async () => {
+      const { payload, error } = buildDispatchPayload();
+      if (error) {
+        setStatus(false, error);
+        return;
+      }
+      const cmd = buildDispatchCurl(payload);
+      try {
+        await navigator.clipboard.writeText(cmd);
+        setStatus(true, 'Copied curl');
+      } catch (e) {
+        $('dispatch_resp').textContent = pretty({ error: String(e), curl: cmd });
+        setStatus(false, 'Copy failed');
+      }
+    });
     $('clear_resp').addEventListener('click', () => {
       $('dispatch_resp').textContent = '{}';
       renderAllocations(null);
@@ -2321,8 +2355,8 @@ struct TimeRange {
 
 #[derive(Debug, Deserialize, Clone)]
 struct IncomingDispatch {
-    asset_id: Option<Uuid>,
-    site_id: Option<Uuid>,
+    asset_id: Option<String>,
+    site_id: Option<String>,
     mw: f64,
     duration_s: Option<u64>,
 }
@@ -2445,12 +2479,24 @@ async fn create_dispatch(
     Json(req): Json<IncomingDispatch>,
 ) -> Response {
     // Validate mutual exclusivity.
-    if req.asset_id.is_some() == req.site_id.is_some() {
-        return StatusCode::BAD_REQUEST.into_response();
+    if req.asset_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).is_some()
+        == req.site_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).is_some()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of asset_id or site_id",
+        )
+            .into_response();
     }
 
     // Site dispatch fan-out.
-    if let Some(site_id) = req.site_id {
+    if let Some(site_id) = req.site_id.as_ref().filter(|s| !s.trim().is_empty()) {
+        let site_id = match Uuid::parse_str(site_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "invalid site_id").into_response();
+            }
+        };
         // Online assets for this site.
         let online_assets: Vec<Uuid> = {
             let streams = state.agent_streams.read().await;
@@ -2462,7 +2508,11 @@ async fn create_dispatch(
         };
         if online_assets.is_empty() {
             tracing::error!("dispatch failed: no online assets for site_id={}", site_id);
-            return StatusCode::BAD_REQUEST.into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("no online assets for site_id={}", site_id),
+            )
+                .into_response();
         }
 
         // Fetch asset metadata for weighting/clamping.
@@ -2477,7 +2527,11 @@ async fn create_dispatch(
         assets_meta.sort_by_key(|a| a.id);
         if assets_meta.is_empty() {
             tracing::error!("dispatch failed: metadata missing for site_id={}", site_id);
-            return StatusCode::BAD_REQUEST.into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("metadata missing for site_id={}", site_id),
+            )
+                .into_response();
         }
 
         let allocations = compute_site_allocations(&assets_meta, req.mw);
@@ -2498,8 +2552,8 @@ async fn create_dispatch(
         let mut results = Vec::new();
         for alloc in allocations.iter() {
             let one = IncomingDispatch {
-                asset_id: Some(alloc.asset_id),
-                site_id: Some(site_id),
+                asset_id: Some(alloc.asset_id.to_string()),
+                site_id: Some(site_id.to_string()),
                 mw: alloc.mw,
                 duration_s: req.duration_s,
             };
@@ -2526,7 +2580,7 @@ async fn create_dispatch(
         Ok(dispatch) => Json(dispatch).into_response(),
         Err(err) => {
             tracing::error!("dispatch failed: {err}");
-            StatusCode::BAD_REQUEST.into_response()
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
     }
 }
@@ -2538,7 +2592,11 @@ async fn handle_single_dispatch(
 ) -> Result<Dispatch> {
     let asset_id = req
         .asset_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .context("asset_id required for single dispatch")?;
+    let asset_id = Uuid::parse_str(asset_id).context("invalid asset_id")?;
     // Cache limits up front so we can log them without holding the write lock.
     let cached_meta = {
         let sim = state.sim.read().await;
@@ -2572,6 +2630,11 @@ async fn handle_single_dispatch(
         );
     }
 
+    let soc_mwhr_override = {
+        let latest = state.latest.read().await;
+        latest.get(&asset_id).map(|t| t.soc_mwhr)
+    };
+
     // Acquire write access to update the setpoint.
     let mut sim = state.sim.write().await;
     let site_id_meta = cached_meta.as_ref().map(|(_, _, _, _, sid)| *sid);
@@ -2583,7 +2646,7 @@ async fn handle_single_dispatch(
         clamped,
     };
 
-    let result = sim.set_dispatch(dispatch_req);
+    let result = sim.set_dispatch(dispatch_req, soc_mwhr_override);
     drop(sim); // release lock before downstream I/O
 
     match result {
