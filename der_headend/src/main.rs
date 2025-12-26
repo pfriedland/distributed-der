@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/assets", get(list_assets))
         .route("/assets/{id}", get(get_asset))
+        .route("/sites", get(list_sites))
         .route("/agents", get(list_agents))
         .route("/telemetry/{id}", get(latest_telemetry))
         .route("/telemetry/{id}/history", get(history_telemetry))
@@ -2251,6 +2252,179 @@ async fn get_asset(State(state): State<AppState>, Path(id): Path<Uuid>) -> Respo
     }
 }
 
+#[derive(Serialize)]
+struct SiteView {
+    site_id: Uuid,
+    site_name: String,
+    location: String,
+    aggregate: SiteAggregate,
+    assets: Vec<AssetView>,
+}
+
+#[derive(Serialize)]
+struct SiteAggregate {
+    asset_count: usize,
+    capacity_mwhr: f64,
+    max_mw: f64,
+    min_mw: f64,
+    min_soc_pct: f64,
+    max_soc_pct: f64,
+    efficiency: f64,
+    ramp_rate_mw_per_min: f64,
+    soc_mwhr: Option<f64>,
+    soc_pct: Option<f64>,
+    current_mw: Option<f64>,
+    setpoint_mw: Option<f64>,
+}
+
+#[derive(Default)]
+struct SiteAggregateBuilder {
+    asset_count: usize,
+    capacity_sum: f64,
+    max_mw_sum: f64,
+    min_mw_sum: f64,
+    weight_sum: f64,
+    min_soc_weighted: f64,
+    max_soc_weighted: f64,
+    efficiency_weighted: f64,
+    ramp_weighted: f64,
+    min_soc_sum: f64,
+    max_soc_sum: f64,
+    efficiency_sum: f64,
+    ramp_sum: f64,
+    soc_mwhr_sum: f64,
+    soc_cap_sum: f64,
+    has_soc: bool,
+    current_mw_sum: f64,
+    current_count: usize,
+    setpoint_mw_sum: f64,
+    setpoint_count: usize,
+}
+
+impl SiteAggregateBuilder {
+    fn add_asset(&mut self, asset: &AssetView) {
+        let cap = asset.capacity_mwhr.max(0.0);
+        self.asset_count += 1;
+        self.capacity_sum += cap;
+        self.max_mw_sum += asset.max_mw;
+        self.min_mw_sum += asset.min_mw;
+
+        self.min_soc_sum += asset.min_soc_pct;
+        self.max_soc_sum += asset.max_soc_pct;
+        self.efficiency_sum += asset.efficiency;
+        self.ramp_sum += asset.ramp_rate_mw_per_min;
+
+        if cap > 0.0 {
+            self.weight_sum += cap;
+            self.min_soc_weighted += asset.min_soc_pct * cap;
+            self.max_soc_weighted += asset.max_soc_pct * cap;
+            self.efficiency_weighted += asset.efficiency * cap;
+            self.ramp_weighted += asset.ramp_rate_mw_per_min * cap;
+        }
+
+        if let Some(soc_mwhr) = asset.soc_mwhr {
+            self.soc_mwhr_sum += soc_mwhr;
+            self.soc_cap_sum += cap;
+            self.has_soc = true;
+        }
+        if let Some(current_mw) = asset.current_mw {
+            self.current_mw_sum += current_mw;
+            self.current_count += 1;
+        }
+        if let Some(setpoint_mw) = asset.setpoint_mw {
+            self.setpoint_mw_sum += setpoint_mw;
+            self.setpoint_count += 1;
+        }
+    }
+
+    fn finish(self) -> SiteAggregate {
+        let avg_or_weighted = |weighted_sum: f64, plain_sum: f64, weight: f64, count: usize| {
+            if weight > 0.0 {
+                weighted_sum / weight
+            } else if count > 0 {
+                plain_sum / count as f64
+            } else {
+                0.0
+            }
+        };
+
+        SiteAggregate {
+            asset_count: self.asset_count,
+            capacity_mwhr: self.capacity_sum,
+            max_mw: self.max_mw_sum,
+            min_mw: self.min_mw_sum,
+            min_soc_pct: avg_or_weighted(
+                self.min_soc_weighted,
+                self.min_soc_sum,
+                self.weight_sum,
+                self.asset_count,
+            ),
+            max_soc_pct: avg_or_weighted(
+                self.max_soc_weighted,
+                self.max_soc_sum,
+                self.weight_sum,
+                self.asset_count,
+            ),
+            efficiency: avg_or_weighted(
+                self.efficiency_weighted,
+                self.efficiency_sum,
+                self.weight_sum,
+                self.asset_count,
+            ),
+            ramp_rate_mw_per_min: avg_or_weighted(
+                self.ramp_weighted,
+                self.ramp_sum,
+                self.weight_sum,
+                self.asset_count,
+            ),
+            soc_mwhr: self.has_soc.then_some(self.soc_mwhr_sum),
+            soc_pct: if self.has_soc && self.soc_cap_sum > 0.0 {
+                Some(self.soc_mwhr_sum / self.soc_cap_sum * 100.0)
+            } else {
+                None
+            },
+            current_mw: (self.current_count > 0).then_some(self.current_mw_sum),
+            setpoint_mw: (self.setpoint_count > 0).then_some(self.setpoint_mw_sum),
+        }
+    }
+}
+
+struct SiteAccumulator {
+    site_id: Uuid,
+    site_name: String,
+    location: String,
+    assets: Vec<AssetView>,
+    aggregate: SiteAggregateBuilder,
+}
+
+async fn list_sites(State(state): State<AppState>) -> Json<Vec<SiteView>> {
+    let assets = build_asset_views(&state).await;
+    let mut sites: HashMap<Uuid, SiteAccumulator> = HashMap::new();
+    for asset in assets {
+        let entry = sites.entry(asset.site_id).or_insert_with(|| SiteAccumulator {
+            site_id: asset.site_id,
+            site_name: asset.site_name.clone(),
+            location: asset.location.clone(),
+            assets: Vec::new(),
+            aggregate: SiteAggregateBuilder::default(),
+        });
+        entry.aggregate.add_asset(&asset);
+        entry.assets.push(asset);
+    }
+    let mut rows: Vec<SiteView> = sites
+        .into_values()
+        .map(|site| SiteView {
+            site_id: site.site_id,
+            site_name: site.site_name,
+            location: site.location,
+            assets: site.assets,
+            aggregate: site.aggregate.finish(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.site_name.to_lowercase().cmp(&b.site_name.to_lowercase()));
+    Json(rows)
+}
+
 async fn build_asset_views(state: &AppState) -> Vec<AssetView> {
     let sim = state.sim.read().await;
     let mut latest = state.latest.read().await.clone();
@@ -2268,23 +2442,23 @@ async fn build_asset_views(state: &AppState) -> Vec<AssetView> {
     for asset in sim.assets.values() {
         let telemetry = latest.get(&asset.id);
         rows.push(AssetView {
-            id: asset.id,
-            site_id: asset.site_id,
-            site_name: asset.site_name.clone(),
-            name: asset.name.clone(),
-            location: asset.location.clone(),
             capacity_mwhr: asset.capacity_mwhr,
+            current_mw: telemetry.map(|t| t.current_mw),
+            efficiency: asset.efficiency,
+            id: asset.id,
+            location: asset.location.clone(),
             max_mw: asset.max_mw,
+            max_soc_pct: asset.max_soc_pct,
             min_mw: asset.min_mw,
             min_soc_pct: asset.min_soc_pct,
-            max_soc_pct: asset.max_soc_pct,
-            efficiency: asset.efficiency,
+            name: asset.name.clone(),
             ramp_rate_mw_per_min: asset.ramp_rate_mw_per_min,
-            soc_pct: telemetry.map(|t| t.soc_pct),
-            soc_mwhr: telemetry.map(|t| t.soc_mwhr),
-            status: telemetry.map(|t| t.status.clone()),
-            current_mw: telemetry.map(|t| t.current_mw),
             setpoint_mw: telemetry.map(|t| t.setpoint_mw),
+            soc_mwhr: telemetry.map(|t| t.soc_mwhr),
+            soc_pct: telemetry.map(|t| t.soc_pct),
+            site_id: asset.site_id,
+            site_name: asset.site_name.clone(),
+            status: telemetry.map(|t| t.status.clone()),
         });
     }
     rows
@@ -2371,23 +2545,24 @@ struct HeartbeatRow {
 
 #[derive(Serialize)]
 struct AssetView {
-    id: Uuid,
-    site_id: Uuid,
-    site_name: String,
-    name: String,
-    location: String,
     capacity_mwhr: f64,
+    current_mw: Option<f64>,
+    efficiency: f64,
+    id: Uuid,
+    location: String,
     max_mw: f64,
+    max_soc_pct: f64,
     min_mw: f64,
     min_soc_pct: f64,
-    max_soc_pct: f64,
-    efficiency: f64,
+    name: String,
     ramp_rate_mw_per_min: f64,
-    soc_pct: Option<f64>,
-    soc_mwhr: Option<f64>,
-    status: Option<String>,
-    current_mw: Option<f64>,
     setpoint_mw: Option<f64>,
+    soc_mwhr: Option<f64>,
+    soc_pct: Option<f64>,
+    #[serde(skip_serializing)]
+    site_id: Uuid,
+    site_name: String,
+    status: Option<String>,
 }
 
 async fn history_telemetry(
