@@ -15,6 +15,43 @@ def load_ssot(path):
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
+def validate_ssot(ssot, strict=True):
+    sites = ssot.get("sites", [])
+    assets = ssot.get("assets", [])
+    errors = []
+    site_ids = [s.get("id") for s in sites]
+    if len(site_ids) != len(set(site_ids)):
+        errors.append("duplicate site id found in SSOT")
+    site_id_set = set(site_ids)
+    for asset in assets:
+        site_id = asset.get("site_id")
+        if site_id not in site_id_set:
+            errors.append(
+                "asset %s references unknown site_id %s" % (asset.get("id"), site_id)
+            )
+    for site in sites:
+        opcua = site.get("opcua")
+        if not opcua:
+            continue
+        missing = [k for k in (
+            "endpoint",
+            "default_setpoint_provider",
+            "setpoint_provider",
+            "telemetry_provider",
+            "telemetry_interval_s",
+            "telemetry_write_sim",
+        ) if k not in opcua]
+        if missing:
+            errors.append(
+                "site %s opcua config missing keys: %s"
+                % (site.get("id"), ", ".join(missing))
+            )
+    if errors:
+        msg = "validation failed:\\n- " + "\\n- ".join(errors)
+        if strict:
+            raise ValueError(msg)
+        print("WARNING:", msg)
+
 
 def asset_folder(asset_name, read_only=False):
     telemetry_tags = [
@@ -570,6 +607,16 @@ def parse_args():
         action="store_true",
         help="Skip writing ssot.duckdb.",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail on SSOT validation errors (default).",
+    )
+    parser.add_argument(
+        "--warn",
+        action="store_true",
+        help="Warn on SSOT validation errors and continue.",
+    )
     return parser.parse_args()
 
 
@@ -581,6 +628,12 @@ def main():
         else DEFAULT_SSOT_PATH
     )
     ssot = load_ssot(ssot_path)
+    strict = True
+    if args.warn:
+        strict = False
+    if args.strict:
+        strict = True
+    validate_ssot(ssot, strict=strict)
     sites = ssot["sites"]
     assets = ssot["assets"]
 
