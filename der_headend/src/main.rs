@@ -795,6 +795,19 @@ async fn handle_agent_telemetry(state: &AppState, t: proto::Telemetry) -> Result
         max_mw: t.max_mw,
         min_mw: t.min_mw,
         status: t.status.clone(),
+        voltage_v: t.voltage_v,
+        current_a: t.current_a,
+        dc_bus_v: t.dc_bus_v,
+        dc_bus_a: t.dc_bus_a,
+        temperature_cell_f: t.temperature_cell_f,
+        temperature_module_f: t.temperature_module_f,
+        temperature_ambient_f: t.temperature_ambient_f,
+        soh_pct: t.soh_pct,
+        cycle_count: t.cycle_count,
+        energy_in_mwh: t.energy_in_mwh,
+        energy_out_mwh: t.energy_out_mwh,
+        available_charge_kw: t.available_charge_kw,
+        available_discharge_kw: t.available_discharge_kw,
     };
 
     {
@@ -826,6 +839,19 @@ fn telemetry_to_proto(snap: &Telemetry) -> proto::Telemetry {
         max_mw: snap.max_mw,
         min_mw: snap.min_mw,
         status: snap.status.clone(),
+        voltage_v: snap.voltage_v,
+        current_a: snap.current_a,
+        dc_bus_v: snap.dc_bus_v,
+        dc_bus_a: snap.dc_bus_a,
+        temperature_cell_f: snap.temperature_cell_f,
+        temperature_module_f: snap.temperature_module_f,
+        temperature_ambient_f: snap.temperature_ambient_f,
+        soh_pct: snap.soh_pct,
+        cycle_count: snap.cycle_count,
+        energy_in_mwh: snap.energy_in_mwh,
+        energy_out_mwh: snap.energy_out_mwh,
+        available_charge_kw: snap.available_charge_kw,
+        available_discharge_kw: snap.available_discharge_kw,
     }
 }
 
@@ -889,7 +915,20 @@ async fn build_bootstrap_response(
                     setpoint_mw,
                     max_mw,
                     min_mw,
-                    status
+                    status,
+                    voltage_v,
+                    current_a,
+                    dc_bus_v,
+                    dc_bus_a,
+                    temperature_cell_f,
+                    temperature_module_f,
+                    temperature_ambient_f,
+                    soh_pct,
+                    cycle_count,
+                    energy_in_mwh,
+                    energy_out_mwh,
+                    available_charge_kw,
+                    available_discharge_kw
                 FROM telemetry
                 WHERE asset_id = ANY($1)
                 ORDER BY asset_id, ts DESC
@@ -915,6 +954,19 @@ async fn build_bootstrap_response(
                         max_mw: row.max_mw,
                         min_mw: row.min_mw,
                         status: row.status,
+                        voltage_v: row.voltage_v,
+                        current_a: row.current_a,
+                        dc_bus_v: row.dc_bus_v,
+                        dc_bus_a: row.dc_bus_a,
+                        temperature_cell_f: row.temperature_cell_f,
+                        temperature_module_f: row.temperature_module_f,
+                        temperature_ambient_f: row.temperature_ambient_f,
+                        soh_pct: row.soh_pct,
+                        cycle_count: row.cycle_count as u64,
+                        energy_in_mwh: row.energy_in_mwh,
+                        energy_out_mwh: row.energy_out_mwh,
+                        available_charge_kw: row.available_charge_kw,
+                        available_discharge_kw: row.available_discharge_kw,
                     },
                 );
             }
@@ -1208,13 +1260,79 @@ async fn init_db(pool: &PgPool) -> Result<()> {
             setpoint_mw double precision NOT NULL,
             max_mw double precision NOT NULL,
             min_mw double precision NOT NULL,
-            status text NOT NULL
+            status text NOT NULL,
+            voltage_v double precision NOT NULL DEFAULT 0,
+            current_a double precision NOT NULL DEFAULT 0,
+            dc_bus_v double precision NOT NULL DEFAULT 0,
+            dc_bus_a double precision NOT NULL DEFAULT 0,
+            temperature_cell_f double precision NOT NULL DEFAULT 0,
+            temperature_module_f double precision NOT NULL DEFAULT 0,
+            temperature_ambient_f double precision NOT NULL DEFAULT 0,
+            soh_pct double precision NOT NULL DEFAULT 0,
+            cycle_count bigint NOT NULL DEFAULT 0,
+            energy_in_mwh double precision NOT NULL DEFAULT 0,
+            energy_out_mwh double precision NOT NULL DEFAULT 0,
+            available_charge_kw double precision NOT NULL DEFAULT 0,
+            available_discharge_kw double precision NOT NULL DEFAULT 0
         );
     "#,
     )
     .execute(pool)
     .await
     .context("creating telemetry table")?;
+
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS voltage_v double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.voltage_v")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS current_a double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.current_a")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS dc_bus_v double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.dc_bus_v")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS dc_bus_a double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.dc_bus_a")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_cell_f double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.temperature_cell_f")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_module_f double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.temperature_module_f")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_ambient_f double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.temperature_ambient_f")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS soh_pct double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.soh_pct")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cycle_count bigint NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.cycle_count")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS energy_in_mwh double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.energy_in_mwh")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS energy_out_mwh double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.energy_out_mwh")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_charge_kw double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.available_charge_kw")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_discharge_kw double precision NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.available_discharge_kw")?;
 
     sqlx::query(
         r#"
@@ -1321,8 +1439,12 @@ async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()> {
             r#"
             INSERT INTO telemetry (
                 asset_id, site_id, ts, soc_mwhr, soc_pct,
-                capacity_mwhr, current_mw, setpoint_mw, max_mw, min_mw, status
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                capacity_mwhr, current_mw, setpoint_mw, max_mw, min_mw, status,
+                voltage_v, current_a, dc_bus_v, dc_bus_a,
+                temperature_cell_f, temperature_module_f, temperature_ambient_f,
+                soh_pct, cycle_count, energy_in_mwh, energy_out_mwh,
+                available_charge_kw, available_discharge_kw
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
         "#,
         )
         .bind(snap.asset_id)
@@ -1336,6 +1458,19 @@ async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()> {
         .bind(snap.max_mw)
         .bind(snap.min_mw)
         .bind(&snap.status)
+        .bind(snap.voltage_v)
+        .bind(snap.current_a)
+        .bind(snap.dc_bus_v)
+        .bind(snap.dc_bus_a)
+        .bind(snap.temperature_cell_f)
+        .bind(snap.temperature_module_f)
+        .bind(snap.temperature_ambient_f)
+        .bind(snap.soh_pct)
+        .bind(snap.cycle_count as i64)
+        .bind(snap.energy_in_mwh)
+        .bind(snap.energy_out_mwh)
+        .bind(snap.available_charge_kw)
+        .bind(snap.available_discharge_kw)
         .execute(pool)
         .await
         .context("inserting telemetry row")?;
@@ -2449,9 +2584,17 @@ async fn build_asset_views(state: &AppState) -> Vec<AssetView> {
     for asset in sim.assets.values() {
         let telemetry = latest.get(&asset.id);
         rows.push(AssetView {
+            available_charge_kw: telemetry.map(|t| t.available_charge_kw),
+            available_discharge_kw: telemetry.map(|t| t.available_discharge_kw),
             capacity_mwhr: asset.capacity_mwhr,
+            current_a: telemetry.map(|t| t.current_a),
             current_mw: telemetry.map(|t| t.current_mw),
+            cycle_count: telemetry.map(|t| t.cycle_count),
+            dc_bus_a: telemetry.map(|t| t.dc_bus_a),
+            dc_bus_v: telemetry.map(|t| t.dc_bus_v),
             efficiency: asset.efficiency,
+            energy_in_mwh: telemetry.map(|t| t.energy_in_mwh),
+            energy_out_mwh: telemetry.map(|t| t.energy_out_mwh),
             id: asset.id,
             location: asset.location.clone(),
             max_mw: asset.max_mw,
@@ -2461,11 +2604,16 @@ async fn build_asset_views(state: &AppState) -> Vec<AssetView> {
             name: asset.name.clone(),
             ramp_rate_mw_per_min: asset.ramp_rate_mw_per_min,
             setpoint_mw: telemetry.map(|t| t.setpoint_mw),
+            soh_pct: telemetry.map(|t| t.soh_pct),
             soc_mwhr: telemetry.map(|t| t.soc_mwhr),
             soc_pct: telemetry.map(|t| t.soc_pct),
             site_id: asset.site_id,
             site_name: asset.site_name.clone(),
             status: telemetry.map(|t| t.status.clone()),
+            temperature_ambient_f: telemetry.map(|t| t.temperature_ambient_f),
+            temperature_cell_f: telemetry.map(|t| t.temperature_cell_f),
+            temperature_module_f: telemetry.map(|t| t.temperature_module_f),
+            voltage_v: telemetry.map(|t| t.voltage_v),
         });
     }
     rows
@@ -2500,6 +2648,19 @@ struct TelemetryRow {
     max_mw: f64,
     min_mw: f64,
     status: String,
+    voltage_v: f64,
+    current_a: f64,
+    dc_bus_v: f64,
+    dc_bus_a: f64,
+    temperature_cell_f: f64,
+    temperature_module_f: f64,
+    temperature_ambient_f: f64,
+    soh_pct: f64,
+    cycle_count: i64,
+    energy_in_mwh: f64,
+    energy_out_mwh: f64,
+    available_charge_kw: f64,
+    available_discharge_kw: f64,
     asset_id: Uuid,
     site_id: Uuid,
 }
@@ -2518,6 +2679,19 @@ struct TelemetrySnapshotRow {
     max_mw: f64,
     min_mw: f64,
     status: String,
+    voltage_v: f64,
+    current_a: f64,
+    dc_bus_v: f64,
+    dc_bus_a: f64,
+    temperature_cell_f: f64,
+    temperature_module_f: f64,
+    temperature_ambient_f: f64,
+    soh_pct: f64,
+    cycle_count: i64,
+    energy_in_mwh: f64,
+    energy_out_mwh: f64,
+    available_charge_kw: f64,
+    available_discharge_kw: f64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -2552,9 +2726,17 @@ struct HeartbeatRow {
 
 #[derive(Serialize)]
 struct AssetView {
+    available_charge_kw: Option<f64>,
+    available_discharge_kw: Option<f64>,
     capacity_mwhr: f64,
+    current_a: Option<f64>,
     current_mw: Option<f64>,
+    cycle_count: Option<u64>,
+    dc_bus_a: Option<f64>,
+    dc_bus_v: Option<f64>,
     efficiency: f64,
+    energy_in_mwh: Option<f64>,
+    energy_out_mwh: Option<f64>,
     id: Uuid,
     location: String,
     max_mw: f64,
@@ -2564,11 +2746,16 @@ struct AssetView {
     name: String,
     ramp_rate_mw_per_min: f64,
     setpoint_mw: Option<f64>,
+    soh_pct: Option<f64>,
     soc_mwhr: Option<f64>,
     soc_pct: Option<f64>,
     site_id: Uuid,
     site_name: String,
     status: Option<String>,
+    temperature_ambient_f: Option<f64>,
+    temperature_cell_f: Option<f64>,
+    temperature_module_f: Option<f64>,
+    voltage_v: Option<f64>,
 }
 
 async fn history_telemetry(
@@ -2612,6 +2799,19 @@ async fn history_telemetry(
             t.max_mw,
             t.min_mw,
             t.status,
+            t.voltage_v,
+            t.current_a,
+            t.dc_bus_v,
+            t.dc_bus_a,
+            t.temperature_cell_f,
+            t.temperature_module_f,
+            t.temperature_ambient_f,
+            t.soh_pct,
+            t.cycle_count,
+            t.energy_in_mwh,
+            t.energy_out_mwh,
+            t.available_charge_kw,
+            t.available_discharge_kw,
             t.asset_id,
             t.site_id
         FROM telemetry t

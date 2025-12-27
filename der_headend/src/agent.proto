@@ -32,6 +32,19 @@ message Telemetry {
   double max_mw = 10;
   double min_mw = 11;
   string status = 12;
+  double voltage_v = 13;
+  double current_a = 14;
+  double dc_bus_v = 15;
+  double dc_bus_a = 16;
+  double temperature_cell_f = 17;
+  double temperature_module_f = 18;
+  double temperature_ambient_f = 19;
+  double soh_pct = 20;
+  uint64 cycle_count = 21;
+  double energy_in_mwh = 22;
+  double energy_out_mwh = 23;
+  double available_charge_kw = 24;
+  double available_discharge_kw = 25;
 }
 
 message Heartbeat {

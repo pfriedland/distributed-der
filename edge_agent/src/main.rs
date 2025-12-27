@@ -344,6 +344,19 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         max_mw: t.max_mw,
         min_mw: t.min_mw,
         status: t.status.clone(),
+        voltage_v: t.voltage_v,
+        current_a: t.current_a,
+        dc_bus_v: t.dc_bus_v,
+        dc_bus_a: t.dc_bus_a,
+        temperature_cell_f: t.temperature_cell_f,
+        temperature_module_f: t.temperature_module_f,
+        temperature_ambient_f: t.temperature_ambient_f,
+        soh_pct: t.soh_pct,
+        cycle_count: t.cycle_count,
+        energy_in_mwh: t.energy_in_mwh,
+        energy_out_mwh: t.energy_out_mwh,
+        available_charge_kw: t.available_charge_kw,
+        available_discharge_kw: t.available_discharge_kw,
     }
 }
 
@@ -378,6 +391,8 @@ fn telemetry_from_opcua(asset: &Asset, sim: &BessState, sample: OpcUaTelemetrySa
             "idle".to_string()
         }
     });
+    let available_charge_kw = (-asset.min_mw).max(0.0) * 1000.0;
+    let available_discharge_kw = asset.max_mw.max(0.0) * 1000.0;
 
     Telemetry {
         asset_id: asset.id,
@@ -392,6 +407,21 @@ fn telemetry_from_opcua(asset: &Asset, sim: &BessState, sample: OpcUaTelemetrySa
         max_mw: asset.max_mw,
         min_mw: asset.min_mw,
         status,
+        voltage_v: sample.voltage_v.unwrap_or(0.0),
+        current_a: sample.current_a.unwrap_or(0.0),
+        dc_bus_v: sample.dc_bus_v.unwrap_or(0.0),
+        dc_bus_a: sample.dc_bus_a.unwrap_or(0.0),
+        temperature_cell_f: sample.temperature_cell_f.unwrap_or(0.0),
+        temperature_module_f: sample.temperature_module_f.unwrap_or(0.0),
+        temperature_ambient_f: sample.temperature_ambient_f.unwrap_or(0.0),
+        soh_pct: sample.soh_pct.unwrap_or(100.0),
+        cycle_count: sample.cycle_count.unwrap_or(0),
+        energy_in_mwh: sample.energy_in_mwh.unwrap_or(0.0),
+        energy_out_mwh: sample.energy_out_mwh.unwrap_or(0.0),
+        available_charge_kw: sample.available_charge_kw.unwrap_or(available_charge_kw),
+        available_discharge_kw: sample
+            .available_discharge_kw
+            .unwrap_or(available_discharge_kw),
     }
 }
 
@@ -888,6 +918,19 @@ struct TelemetryNodes {
     soc_pct: Option<NodeId>,
     soc_mwhr: Option<NodeId>,
     status: Option<NodeId>,
+    voltage_v: Option<NodeId>,
+    current_a: Option<NodeId>,
+    dc_bus_v: Option<NodeId>,
+    dc_bus_a: Option<NodeId>,
+    temperature_cell_f: Option<NodeId>,
+    temperature_module_f: Option<NodeId>,
+    temperature_ambient_f: Option<NodeId>,
+    soh_pct: Option<NodeId>,
+    cycle_count: Option<NodeId>,
+    energy_in_mwh: Option<NodeId>,
+    energy_out_mwh: Option<NodeId>,
+    available_charge_kw: Option<NodeId>,
+    available_discharge_kw: Option<NodeId>,
 }
 
 impl TelemetryNodes {
@@ -900,6 +943,40 @@ impl TelemetryNodes {
                 .clone()
                 .or_else(|| defaults.soc_mwhr.clone()),
             status: self.status.clone().or_else(|| defaults.status.clone()),
+            voltage_v: self.voltage_v.clone().or_else(|| defaults.voltage_v.clone()),
+            current_a: self.current_a.clone().or_else(|| defaults.current_a.clone()),
+            dc_bus_v: self.dc_bus_v.clone().or_else(|| defaults.dc_bus_v.clone()),
+            dc_bus_a: self.dc_bus_a.clone().or_else(|| defaults.dc_bus_a.clone()),
+            temperature_cell_f: self
+                .temperature_cell_f
+                .clone()
+                .or_else(|| defaults.temperature_cell_f.clone()),
+            temperature_module_f: self
+                .temperature_module_f
+                .clone()
+                .or_else(|| defaults.temperature_module_f.clone()),
+            temperature_ambient_f: self
+                .temperature_ambient_f
+                .clone()
+                .or_else(|| defaults.temperature_ambient_f.clone()),
+            soh_pct: self.soh_pct.clone().or_else(|| defaults.soh_pct.clone()),
+            cycle_count: self.cycle_count.clone().or_else(|| defaults.cycle_count.clone()),
+            energy_in_mwh: self
+                .energy_in_mwh
+                .clone()
+                .or_else(|| defaults.energy_in_mwh.clone()),
+            energy_out_mwh: self
+                .energy_out_mwh
+                .clone()
+                .or_else(|| defaults.energy_out_mwh.clone()),
+            available_charge_kw: self
+                .available_charge_kw
+                .clone()
+                .or_else(|| defaults.available_charge_kw.clone()),
+            available_discharge_kw: self
+                .available_discharge_kw
+                .clone()
+                .or_else(|| defaults.available_discharge_kw.clone()),
         }
     }
 }
@@ -937,6 +1014,32 @@ struct OpcUaTelemetryMap {
     soc_mwhr: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    voltage_v: Option<String>,
+    #[serde(default)]
+    current_a: Option<String>,
+    #[serde(default)]
+    dc_bus_v: Option<String>,
+    #[serde(default)]
+    dc_bus_a: Option<String>,
+    #[serde(default)]
+    temperature_cell_f: Option<String>,
+    #[serde(default)]
+    temperature_module_f: Option<String>,
+    #[serde(default)]
+    temperature_ambient_f: Option<String>,
+    #[serde(default)]
+    soh_pct: Option<String>,
+    #[serde(default)]
+    cycle_count: Option<String>,
+    #[serde(default)]
+    energy_in_mwh: Option<String>,
+    #[serde(default)]
+    energy_out_mwh: Option<String>,
+    #[serde(default)]
+    available_charge_kw: Option<String>,
+    #[serde(default)]
+    available_discharge_kw: Option<String>,
 }
 
 impl OpcUaConfig {
@@ -974,6 +1077,45 @@ impl OpcUaConfig {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             status: std::env::var("OPCUA_NODE_STATUS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            voltage_v: std::env::var("OPCUA_NODE_VOLTAGE_V")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            current_a: std::env::var("OPCUA_NODE_CURRENT_A")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            dc_bus_v: std::env::var("OPCUA_NODE_DC_BUS_V")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            dc_bus_a: std::env::var("OPCUA_NODE_DC_BUS_A")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_cell_f: std::env::var("OPCUA_NODE_TEMPERATURE_CELL_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_module_f: std::env::var("OPCUA_NODE_TEMPERATURE_MODULE_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_ambient_f: std::env::var("OPCUA_NODE_TEMPERATURE_AMBIENT_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            soh_pct: std::env::var("OPCUA_NODE_SOH_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            cycle_count: std::env::var("OPCUA_NODE_CYCLE_COUNT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            energy_in_mwh: std::env::var("OPCUA_NODE_ENERGY_IN_MWH")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            energy_out_mwh: std::env::var("OPCUA_NODE_ENERGY_OUT_MWH")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            available_charge_kw: std::env::var("OPCUA_NODE_AVAILABLE_CHARGE_KW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            available_discharge_kw: std::env::var("OPCUA_NODE_AVAILABLE_DISCHARGE_KW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
         };
@@ -1083,12 +1225,116 @@ impl OpcUaConfig {
             ),
             None => None,
         };
+        let voltage_v = match &map.voltage_v {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry voltage_v node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let current_a = match &map.current_a {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry current_a node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let dc_bus_v = match &map.dc_bus_v {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry dc_bus_v node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let dc_bus_a = match &map.dc_bus_a {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry dc_bus_a node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_cell_f = match &map.temperature_cell_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_cell_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_module_f = match &map.temperature_module_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_module_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_ambient_f = match &map.temperature_ambient_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_ambient_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let soh_pct = match &map.soh_pct {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry soh_pct node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let cycle_count = match &map.cycle_count {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry cycle_count node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let energy_in_mwh = match &map.energy_in_mwh {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry energy_in_mwh node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let energy_out_mwh = match &map.energy_out_mwh {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry energy_out_mwh node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let available_charge_kw = match &map.available_charge_kw {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry available_charge_kw node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let available_discharge_kw = match &map.available_discharge_kw {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry available_discharge_kw node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
 
         Ok(TelemetryNodes {
             current_mw,
             soc_pct,
             soc_mwhr,
             status,
+            voltage_v,
+            current_a,
+            dc_bus_v,
+            dc_bus_a,
+            temperature_cell_f,
+            temperature_module_f,
+            temperature_ambient_f,
+            soh_pct,
+            cycle_count,
+            energy_in_mwh,
+            energy_out_mwh,
+            available_charge_kw,
+            available_discharge_kw,
         })
     }
 }
@@ -1461,6 +1707,19 @@ impl OpcUaClient {
             || nodes.soc_pct.is_some()
             || nodes.soc_mwhr.is_some()
             || nodes.status.is_some()
+            || nodes.voltage_v.is_some()
+            || nodes.current_a.is_some()
+            || nodes.dc_bus_v.is_some()
+            || nodes.dc_bus_a.is_some()
+            || nodes.temperature_cell_f.is_some()
+            || nodes.temperature_module_f.is_some()
+            || nodes.temperature_ambient_f.is_some()
+            || nodes.soh_pct.is_some()
+            || nodes.cycle_count.is_some()
+            || nodes.energy_in_mwh.is_some()
+            || nodes.energy_out_mwh.is_some()
+            || nodes.available_charge_kw.is_some()
+            || nodes.available_discharge_kw.is_some()
     }
 
     fn telemetry_write_sim_enabled(&self) -> bool {
@@ -1586,6 +1845,201 @@ impl OpcUaClient {
                 },
             });
         }
+        if let Some(node) = nodes.voltage_v {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.voltage_v as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.current_a {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.current_a as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.dc_bus_v {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.dc_bus_v as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.dc_bus_a {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.dc_bus_a as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_cell_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_cell_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_module_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_module_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_ambient_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_ambient_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soh_pct {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.soh_pct as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.cycle_count {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::UInt64(snap.cycle_count)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.energy_in_mwh {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.energy_in_mwh as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.energy_out_mwh {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.energy_out_mwh as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.available_charge_kw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.available_charge_kw as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.available_discharge_kw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.available_discharge_kw as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
 
         if writes.is_empty() {
             return Ok(());
@@ -1653,6 +2107,123 @@ impl OpcUaClient {
             });
             fields.push(OpcUaField::Status);
         }
+        if let Some(node) = nodes.voltage_v {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::VoltageV);
+        }
+        if let Some(node) = nodes.current_a {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::CurrentA);
+        }
+        if let Some(node) = nodes.dc_bus_v {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::DcBusV);
+        }
+        if let Some(node) = nodes.dc_bus_a {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::DcBusA);
+        }
+        if let Some(node) = nodes.temperature_cell_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureCellF);
+        }
+        if let Some(node) = nodes.temperature_module_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureModuleF);
+        }
+        if let Some(node) = nodes.temperature_ambient_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureAmbientF);
+        }
+        if let Some(node) = nodes.soh_pct {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::SohPct);
+        }
+        if let Some(node) = nodes.cycle_count {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::CycleCount);
+        }
+        if let Some(node) = nodes.energy_in_mwh {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::EnergyInMwh);
+        }
+        if let Some(node) = nodes.energy_out_mwh {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::EnergyOutMwh);
+        }
+        if let Some(node) = nodes.available_charge_kw {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::AvailableChargeKw);
+        }
+        if let Some(node) = nodes.available_discharge_kw {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::AvailableDischargeKw);
+        }
 
         if read_ids.is_empty() {
             return Ok(None);
@@ -1682,6 +2253,29 @@ impl OpcUaClient {
                 OpcUaField::SocPct => sample.soc_pct = value.and_then(variant_to_f64),
                 OpcUaField::SocMwhr => sample.soc_mwhr = value.and_then(variant_to_f64),
                 OpcUaField::Status => sample.status = value.and_then(variant_to_string),
+                OpcUaField::VoltageV => sample.voltage_v = value.and_then(variant_to_f64),
+                OpcUaField::CurrentA => sample.current_a = value.and_then(variant_to_f64),
+                OpcUaField::DcBusV => sample.dc_bus_v = value.and_then(variant_to_f64),
+                OpcUaField::DcBusA => sample.dc_bus_a = value.and_then(variant_to_f64),
+                OpcUaField::TemperatureCellF => {
+                    sample.temperature_cell_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::TemperatureModuleF => {
+                    sample.temperature_module_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::TemperatureAmbientF => {
+                    sample.temperature_ambient_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::SohPct => sample.soh_pct = value.and_then(variant_to_f64),
+                OpcUaField::CycleCount => sample.cycle_count = value.and_then(variant_to_u64),
+                OpcUaField::EnergyInMwh => sample.energy_in_mwh = value.and_then(variant_to_f64),
+                OpcUaField::EnergyOutMwh => sample.energy_out_mwh = value.and_then(variant_to_f64),
+                OpcUaField::AvailableChargeKw => {
+                    sample.available_charge_kw = value.and_then(variant_to_f64)
+                }
+                OpcUaField::AvailableDischargeKw => {
+                    sample.available_discharge_kw = value.and_then(variant_to_f64)
+                }
             }
         }
 
@@ -1904,6 +2498,19 @@ struct OpcUaTelemetrySample {
     soc_pct: Option<f64>,
     soc_mwhr: Option<f64>,
     status: Option<String>,
+    voltage_v: Option<f64>,
+    current_a: Option<f64>,
+    dc_bus_v: Option<f64>,
+    dc_bus_a: Option<f64>,
+    temperature_cell_f: Option<f64>,
+    temperature_module_f: Option<f64>,
+    temperature_ambient_f: Option<f64>,
+    soh_pct: Option<f64>,
+    cycle_count: Option<u64>,
+    energy_in_mwh: Option<f64>,
+    energy_out_mwh: Option<f64>,
+    available_charge_kw: Option<f64>,
+    available_discharge_kw: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -1912,6 +2519,19 @@ enum OpcUaField {
     SocPct,
     SocMwhr,
     Status,
+    VoltageV,
+    CurrentA,
+    DcBusV,
+    DcBusA,
+    TemperatureCellF,
+    TemperatureModuleF,
+    TemperatureAmbientF,
+    SohPct,
+    CycleCount,
+    EnergyInMwh,
+    EnergyOutMwh,
+    AvailableChargeKw,
+    AvailableDischargeKw,
 }
 
 fn variant_to_f64(value: &Variant) -> Option<f64> {
@@ -1922,6 +2542,18 @@ fn variant_to_f64(value: &Variant) -> Option<f64> {
         Variant::Int64(v) => Some(*v as f64),
         Variant::UInt32(v) => Some(*v as f64),
         Variant::UInt64(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+fn variant_to_u64(value: &Variant) -> Option<u64> {
+    match value {
+        Variant::UInt64(v) => Some(*v),
+        Variant::UInt32(v) => Some(*v as u64),
+        Variant::Int64(v) => (*v).try_into().ok(),
+        Variant::Int32(v) => (*v).try_into().ok(),
+        Variant::Double(v) => (*v as i64).try_into().ok(),
+        Variant::Float(v) => (*v as i64).try_into().ok(),
         _ => None,
     }
 }

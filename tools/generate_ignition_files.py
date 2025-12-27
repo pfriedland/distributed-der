@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import tarfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -60,6 +62,19 @@ def asset_folder(asset_name, read_only=False):
         atomic_tag("current_mw", "Float4", 0, read_only),
         atomic_tag("setpoint_mw", "Float4", 0, read_only),
         atomic_tag("status", "String", "", read_only),
+        atomic_tag("voltage_v", "Float4", 0, read_only),
+        atomic_tag("current_a", "Float4", 0, read_only),
+        atomic_tag("dc_bus_v", "Float4", 0, read_only),
+        atomic_tag("dc_bus_a", "Float4", 0, read_only),
+        atomic_tag("temperature_cell_f", "Float4", 0, read_only),
+        atomic_tag("temperature_module_f", "Float4", 0, read_only),
+        atomic_tag("temperature_ambient_f", "Float4", 0, read_only),
+        atomic_tag("soh_pct", "Float4", 0, read_only),
+        atomic_tag("cycle_count", "Int8", 0, read_only),
+        atomic_tag("energy_in_mwh", "Float4", 0, read_only),
+        atomic_tag("energy_out_mwh", "Float4", 0, read_only),
+        atomic_tag("available_charge_kw", "Float4", 0, read_only),
+        atomic_tag("available_discharge_kw", "Float4", 0, read_only),
     ]
     control_tags = [
         atomic_tag("setpoint_mw", "Float4", 0, read_only),
@@ -230,7 +245,25 @@ def write_opcua_map(map_data, output_dir):
     lines.append("telemetry_assets:")
     for asset in map_data["site_assets"]:
         lines.append("  \"%s\":" % asset["id"])
-        for key in ("current_mw", "soc_pct", "soc_mwhr", "status"):
+        for key in (
+            "current_mw",
+            "soc_pct",
+            "soc_mwhr",
+            "status",
+            "voltage_v",
+            "current_a",
+            "dc_bus_v",
+            "dc_bus_a",
+            "temperature_cell_f",
+            "temperature_module_f",
+            "temperature_ambient_f",
+            "soh_pct",
+            "cycle_count",
+            "energy_in_mwh",
+            "energy_out_mwh",
+            "available_charge_kw",
+            "available_discharge_kw",
+        ):
             lines.append(
                 "    %s: %s"
                 % (
@@ -263,6 +296,19 @@ def collect_tag_rows(assets):
                     ("current_mw", "Float4", 0, False),
                     ("setpoint_mw", "Float4", 0, False),
                     ("status", "String", "", False),
+                    ("voltage_v", "Float4", 0, False),
+                    ("current_a", "Float4", 0, False),
+                    ("dc_bus_v", "Float4", 0, False),
+                    ("dc_bus_a", "Float4", 0, False),
+                    ("temperature_cell_f", "Float4", 0, False),
+                    ("temperature_module_f", "Float4", 0, False),
+                    ("temperature_ambient_f", "Float4", 0, False),
+                    ("soh_pct", "Float4", 0, False),
+                    ("cycle_count", "Int8", 0, False),
+                    ("energy_in_mwh", "Float4", 0, False),
+                    ("energy_out_mwh", "Float4", 0, False),
+                    ("available_charge_kw", "Float4", 0, False),
+                    ("available_discharge_kw", "Float4", 0, False),
                 ],
             ),
             (
@@ -558,7 +604,25 @@ def write_duckdb(output_dir, sites, assets, map_data_list):
                     ),
                 )
             )
-            for field in ("current_mw", "soc_pct", "soc_mwhr", "status"):
+            for field in (
+                "current_mw",
+                "soc_pct",
+                "soc_mwhr",
+                "status",
+                "voltage_v",
+                "current_a",
+                "dc_bus_v",
+                "dc_bus_a",
+                "temperature_cell_f",
+                "temperature_module_f",
+                "temperature_ambient_f",
+                "soh_pct",
+                "cycle_count",
+                "energy_in_mwh",
+                "energy_out_mwh",
+                "available_charge_kw",
+                "available_discharge_kw",
+            ):
                 telemetry_rows.append(
                     (
                         map_data["map_name"],
@@ -661,6 +725,17 @@ def main():
         output_path = write_opcua_map(map_data, opcua_output_dir)
         map_data["output_path"] = output_path
         map_data_list.append(map_data)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    tar_name = "ignition_outputs_%s.tar.gz" % timestamp
+    tar_path = output_dir / tar_name
+    with tarfile.open(tar_path, "w:gz") as tar:
+        if ignition_tags_output.exists():
+            tar.add(ignition_tags_output, arcname="ignition_tags.json")
+        if assets_test_output.exists():
+            tar.add(assets_test_output, arcname="der_headend/assets_test.yaml")
+        for path in sorted(opcua_output_dir.glob("opcua_map_*.yaml")):
+            tar.add(path, arcname="der_headend/%s" % path.name)
 
     if not args.skip_duckdb:
         write_duckdb(output_dir, sites, assets, map_data_list)
