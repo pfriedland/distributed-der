@@ -1840,9 +1840,9 @@ async fn ui_home() -> Html<&'static str> {
         <td>${fmt(t ? t.current_mw : null)}</td>
         <td>${fmt(t ? t.soc_pct : null)}</td>
         <td>${fmt(t ? t.setpoint_mw : null)}</td>
-        <td>${fmt(a.capacity_mwhr)}</td>
-        <td>${fmt(a.min_mw)}</td>
-        <td>${fmt(a.max_mw)}</td>
+        <td>${fmt(t ? t.capacity_mwhr : a.capacity_mwhr)}</td>
+        <td>${fmt(t ? t.min_mw : a.min_mw)}</td>
+        <td>${fmt(t ? t.max_mw : a.max_mw)}</td>
         <td>${fmt(a.min_soc_pct)}</td>
         <td>${fmt(a.max_soc_pct)}</td>
       `;
@@ -2041,8 +2041,15 @@ async fn ui_home() -> Html<&'static str> {
     const assets = await fetchJson('/assets');
     ASSETS = Array.isArray(assets) ? assets : [];
     SITES = new Map();
-    for (const a of ASSETS) {
-      if (a.site_id && a.site_name) SITES.set(a.site_id, a.site_name);
+    try {
+      const sites = await fetchJson('/sites');
+      for (const s of Array.isArray(sites) ? sites : []) {
+        if (s.site_id && s.site_name) SITES.set(s.site_id, s.site_name);
+      }
+    } catch (_) {
+      for (const a of ASSETS) {
+        if (a.site_id && a.site_name) SITES.set(a.site_id, a.site_name);
+      }
     }
     rebuildSelectors();
     renderAssetsTable();
@@ -2559,7 +2566,6 @@ struct AssetView {
     setpoint_mw: Option<f64>,
     soc_mwhr: Option<f64>,
     soc_pct: Option<f64>,
-    #[serde(skip_serializing)]
     site_id: Uuid,
     site_name: String,
     status: Option<String>,

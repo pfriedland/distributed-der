@@ -34,26 +34,39 @@ def read_asset(instance_path):
             raise Exception("HTTP %s: %s" % (code, resp.getText()[:200]))
 
         data = system.util.jsonDecode(resp.getText())
+        results = system.tag.browse("[default]BESS/")
 
-        # Map JSON keys -> telemetry tag relative paths
-        mapping = {
-            "soc_pct": "SOC_percent",
-            "soc_mwhr": "SOC_capacity",
-            "current_mw": "MW",
-            "setpoint_mw": "MW_setpoint",
-            "min_mw": "MW_min",
-            "max_mw": "MW_max",
-            "status": "status",
-            
-        }
 
         tag_paths = []
         values = []
+        logger.trace("%s" % str(data))
 
-        for json_key, tag_rel_path in mapping.items():
-            if json_key in data:
-                tag_paths.append("%s/%s" % (instance_path, tag_rel_path))
-                values.append(data[json_key])
+        for tag in results.getResults():
+            logger.trace(str(tag['name']))
+            _results = system.tag.browse("[default]BESS/%s" % str(tag['name']))
+            for _tag in _results.getResults():
+            	tag_name = str(_tag['name'])
+            	logger.trace(tag_name)
+            	if tag_name in data:
+            	    tag_paths.append("%s/%s" % (instance_path, tag_name))           
+            	    values.append(data[tag_name])
+            	
+        # Map JSON keys -> telemetry tag relative paths
+        mapping = {
+            "soc_pct": "soc_pct",
+            "soc_mwhr": "soc_mwhr",
+            "current_mw": "current_mw",
+            "setpoint_mw": "setpoint_mw",
+            "min_mw": "min_mw",
+            "max_mw": "max_mw",
+            "status": "status",
+            
+        }
+#        for json_key, tag_rel_path in mapping.items():
+#        	logger.info("json_key: %s, tag_rel_path: %s" % (json_key, tag_rel_path))
+#        	if json_key in data:
+#        		tag_paths.append("%s/%s" % (instance_path, tag_rel_path))
+#                values.append(data[json_key])
 
         # health / bookkeeping
 
@@ -66,15 +79,16 @@ def read_asset(instance_path):
 #        for tp in tag_paths:
 #        	logger.info("tagpath: %s" % tp)
         status = system.tag.writeBlocking(tag_paths, values)
-        logger.info("writeBlocking status: %s" % status)
+        logger.debug("writeBlocking status: %s" % status)
 
     except Exception as e:
+    	logger.error("Error writing to Ignition tags" % str(e))
         # mark comms bad + record error
         system.tag.writeBlocking(
             [
-                "%s/telemetry/commsOk" % instance_path,
-                "%s/telemetry/lastError" % instance_path,
-                "%s/telemetry/lastUpdateTs" % instance_path,
+                "%s/commsOk" % instance_path,
+                "%s/lastError" % instance_path,
+                "%s/lastUpdateTs" % instance_path,
             ],
             [False, str(e), system.date.now()],
         )

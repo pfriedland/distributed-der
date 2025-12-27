@@ -18,6 +18,7 @@ use opcua::client::prelude::{
     NodeId, QualifiedName, ReadValueId, SecurityPolicy, Session, TimestampsToReturn, UAString,
     UserTokenPolicy, Variant, WriteValue,
 };
+use opcua::types::StatusCode;
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
 use tokio::{sync::RwLock, task::JoinHandle};
@@ -1806,26 +1807,58 @@ impl OpcUaClient {
                 "urn:edge_agent_opcua_write",
             )?;
 
-            let result = {
-                let session = session.write();
-                session
-                    .write(&writes)
-                    .map_err(|status| anyhow!("opc ua write failed: {:?}", status))
-            };
+            let session_guard = session.write();
+            let result = session_guard.write(&writes);
 
             match result {
                 Ok(statuses) => {
-                    if !statuses.iter().all(|s| s.is_good()) {
-                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                    if statuses.iter().all(|s| s.is_good()) {
+                        return Ok(());
                     }
+                    if writes.len() > 1 && statuses.iter().any(Self::is_size_limit_error) {
+                        tracing::warn!(
+                            "opc ua write too large; retrying per-node writes count={}",
+                            writes.len()
+                        );
+                        Self::write_values_split(&session_guard, &writes)?;
+                        return Ok(());
+                    }
+                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
                 }
-                Err(err) => return Err(err),
+                Err(status) => {
+                    if writes.len() > 1 && Self::is_size_limit_error(&status) {
+                        tracing::warn!(
+                            "opc ua write too large; retrying per-node writes count={}",
+                            writes.len()
+                        );
+                        Self::write_values_split(&session_guard, &writes)?;
+                        return Ok(());
+                    }
+                    return Err(anyhow!("opc ua write failed: {:?}", status));
+                }
             }
-
-            Ok(())
         })
         .await
         .map_err(|e| anyhow!("opc ua task join error: {e}"))?
+    }
+
+    fn write_values_split(session: &Session, writes: &[WriteValue]) -> Result<()> {
+        for write in writes {
+            let statuses = session
+                .write(std::slice::from_ref(write))
+                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))?;
+            if !statuses.iter().all(|s| s.is_good()) {
+                return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_size_limit_error(status: &StatusCode) -> bool {
+        matches!(
+            status.status(),
+            StatusCode::BadEncodingLimitsExceeded | StatusCode::BadTcpMessageTooLarge
+        )
     }
 
     async fn read_values_transient(

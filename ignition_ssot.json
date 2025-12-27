@@ -1,0 +1,97 @@
+{
+  "sites": [
+    {
+      "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "name": "Gateway-Test",
+      "location": "Local",
+      "opcua": {
+        "map_name": "gateway",
+        "endpoint": "opc.tcp://host.containers.internal:62542",
+        "tag_root": "Assets",
+        "default_setpoint_provider": "edge",
+        "setpoint_provider": "edge",
+        "telemetry_provider": "edge",
+        "telemetry_interval_s": 4,
+        "telemetry_write_sim": true
+      }
+    },
+    {
+      "id": "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+      "name": "Campus-Test",
+      "location": "Local",
+      "opcua": {
+        "map_name": "campus",
+        "endpoint": "opc.tcp://host.containers.internal:62541",
+        "tag_root": "Assets",
+        "default_setpoint_provider": "default",
+        "setpoint_provider": "default",
+        "telemetry_provider": "default",
+        "telemetry_interval_s": 4,
+        "telemetry_write_sim": true
+      }
+    }
+  ],
+  "assets": [
+    {
+      "id": "7ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "name": "GT-BESS-A",
+      "site_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "capacity_mwhr": 150,
+      "max_mw": 75,
+      "min_mw": -75,
+      "min_soc_pct": 10,
+      "max_soc_pct": 90,
+      "efficiency": 0.92,
+      "ramp_rate_mw_per_min": 1000
+    },
+    {
+      "id": "8ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "name": "GT-BESS-B",
+      "site_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "capacity_mwhr": 50,
+      "max_mw": 25,
+      "min_mw": -25,
+      "min_soc_pct": 10,
+      "max_soc_pct": 90,
+      "efficiency": 0.91,
+      "ramp_rate_mw_per_min": 1000
+    },
+    {
+      "id": "9ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "name": "GT-BESS-C",
+      "site_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "capacity_mwhr": 40,
+      "max_mw": 20,
+      "min_mw": -20,
+      "min_soc_pct": 10,
+      "max_soc_pct": 90,
+      "efficiency": 0.9,
+      "ramp_rate_mw_per_min": 1000
+    },
+    {
+      "id": "7ba7b812-9dad-11d1-80b4-00c04fd430c8",
+      "name": "CT-BESS-A",
+      "site_id": "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+      "capacity_mwhr": 150,
+      "max_mw": 75,
+      "min_mw": -75,
+      "min_soc_pct": 15,
+      "max_soc_pct": 95,
+      "efficiency": 0.93,
+      "ramp_rate_mw_per_min": 1000
+    },
+    {
+      "id": "8ba7b812-9dad-11d1-80b4-00c04fd430c8",
+      "name": "CT-BESS-B",
+      "site_id": "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+      "capacity_mwhr": 80,
+      "max_mw": 40,
+      "min_mw": -40,
+      "min_soc_pct": 10,
+      "max_soc_pct": 90,
+      "efficiency": 0.92,
+      "ramp_rate_mw_per_min": 1000
+    }
+  ],
+  "opcua_maps": []
+}
