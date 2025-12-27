@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{FromRow, types::Json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
+use sim_core::TelemetryValue;
 #[derive(FromRow)]
 pub struct TelemetrySeed {
     pub asset_id: Uuid,
@@ -74,6 +76,7 @@ pub struct TelemetryRow {
     pub energy_out_mwh: f64,
     pub available_charge_kw: f64,
     pub available_discharge_kw: f64,
+    pub extras: Json<HashMap<String, TelemetryValue>>,
     pub asset_id: Uuid,
     pub site_id: Uuid,
 }
@@ -105,6 +108,7 @@ pub struct TelemetrySnapshotRow {
     pub energy_out_mwh: f64,
     pub available_charge_kw: f64,
     pub available_discharge_kw: f64,
+    pub extras: Json<HashMap<String, TelemetryValue>>,
 }
 
 #[derive(FromRow)]

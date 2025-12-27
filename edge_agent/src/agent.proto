@@ -45,6 +45,17 @@ message Telemetry {
   double energy_out_mwh = 23;
   double available_charge_kw = 24;
   double available_discharge_kw = 25;
+  map<string, TelemetryValue> extras = 26;
+}
+
+message TelemetryValue {
+  oneof value {
+    double f64 = 1;
+    int64 i64 = 2;
+    uint64 u64 = 3;
+    bool bool = 4;
+    string string = 5;
+  }
 }
 
 message Heartbeat {

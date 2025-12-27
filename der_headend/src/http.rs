@@ -92,6 +92,10 @@ pub(crate) async fn ui_home() -> Html<&'static str> {
         <span id="telemetry_status">Select an asset</span>
       </div>
       <pre id="telemetry_json">{}</pre>
+      <div class="row small muted" style="margin-top:6px;">
+        <span>Extras</span>
+      </div>
+      <pre id="telemetry_extras">{}</pre>
     </div>
 
     <div class="card">
@@ -223,9 +227,11 @@ pub(crate) async fn ui_home() -> Html<&'static str> {
     try {
       const data = await fetchJson(`/telemetry/${id}`);
       $('telemetry_json').textContent = pretty(data);
+      $('telemetry_extras').textContent = pretty(data.extras || {});
       setStatus(true, 'Telemetry OK');
     } catch (err) {
       $('telemetry_json').textContent = pretty({ error: String(err) });
+      $('telemetry_extras').textContent = pretty({});
       setStatus(false, 'Telemetry error');
     }
   }
@@ -291,6 +297,7 @@ pub(crate) async fn ui_home() -> Html<&'static str> {
       await loadAgents();
       await loadDispatchHistory();
       if (ASSETS.length) selectAsset(ASSETS[0].id, ASSETS[0].name);
+      setInterval(() => loadAssets().catch(() => {}), 4000);
       setInterval(() => loadAgents().catch(() => {}), 4000);
       setInterval(() => loadDispatchHistory().catch(() => {}), 4000);
       setInterval(() => refreshAssetTelemetry().catch(() => {}), 4000);
@@ -508,6 +515,7 @@ pub(crate) async fn history_telemetry(
             t.energy_out_mwh,
             t.available_charge_kw,
             t.available_discharge_kw,
+            t.extras,
             t.asset_id,
             t.site_id
         FROM telemetry t

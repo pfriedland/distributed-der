@@ -93,5 +93,102 @@
       "ramp_rate_mw_per_min": 1000
     }
   ],
-  "opcua_maps": []
+  "opcua_maps": [],
+  "telemetry_schema": [
+    {
+      "name": "soc_pct",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "soc_mwhr",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "current_mw",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "setpoint_mw",
+      "type": "f64",
+      "source": "computed"
+    },
+    {
+      "name": "status",
+      "type": "string",
+      "source": "opcua"
+    },
+    {
+      "name": "voltage_v",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "current_a",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "dc_bus_v",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "dc_bus_a",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "temperature_cell_f",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "temperature_module_f",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "temperature_ambient_f",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "soh_pct",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "cycle_count",
+      "type": "u64",
+      "source": "opcua"
+    },
+    {
+      "name": "energy_in_mwh",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "energy_out_mwh",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "available_charge_kw",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "available_discharge_kw",
+      "type": "f64",
+      "source": "opcua"
+    },
+    {
+      "name": "inverter_temp_f",
+      "type": "f64",
+      "source": "opcua"
+    }
+  ]
 }

@@ -151,12 +151,9 @@ python3 tools/generate_ignition_files.py --warn
 4) Restart `der_headend` and edge agents.
 
 ## Add or Change Telemetry Fields
-Telemetry fields are defined in the generator (currently: `current_mw`, `soc_pct`, `soc_mwhr`, `status`).
-To add a field:
-1) Update the generator in `tools/generate_ignition_files.py` to include the new field in:
-   - Ignition tag definitions
-   - OPC UA telemetry mapping
-   - DuckDB `opcua_telemetry_nodes` population
+Telemetry fields are metadata-driven via `telemetry_schema` in `ignition_ssot.json`.
+To add or remove a field:
+1) Update `telemetry_schema` entries with `name`, `type`, and optional `source` (`opcua` or `computed`).
 2) Regenerate outputs and report.
 3) Import updated `ignition_tags.json` into Ignition.
 4) Deploy updated `opcua_map_<site>.yaml` and restart edge agents.

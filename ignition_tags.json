@@ -160,6 +160,14 @@
                   "dataType": "Float4",
                   "value": 0,
                   "readOnly": false
+                },
+                {
+                  "name": "inverter_temp_f",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
                 }
               ]
             },
@@ -355,6 +363,14 @@
                 },
                 {
                   "name": "available_discharge_kw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "inverter_temp_f",
                   "tagType": "AtomicTag",
                   "valueSource": "memory",
                   "dataType": "Float4",
@@ -560,6 +576,14 @@
                   "dataType": "Float4",
                   "value": 0,
                   "readOnly": false
+                },
+                {
+                  "name": "inverter_temp_f",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
                 }
               ]
             },
@@ -760,6 +784,14 @@
                   "dataType": "Float4",
                   "value": 0,
                   "readOnly": false
+                },
+                {
+                  "name": "inverter_temp_f",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
                 }
               ]
             },
@@ -955,6 +987,14 @@
                 },
                 {
                   "name": "available_discharge_kw",
+                  "tagType": "AtomicTag",
+                  "valueSource": "memory",
+                  "dataType": "Float4",
+                  "value": 0,
+                  "readOnly": false
+                },
+                {
+                  "name": "inverter_temp_f",
                   "tagType": "AtomicTag",
                   "valueSource": "memory",
                   "dataType": "Float4",

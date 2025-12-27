@@ -30,7 +30,7 @@ use opcua::client::prelude::{
 };
 use opcua::types::StatusCode;
 use serde::{Deserialize, Serialize};
-use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
+use sim_core::{Asset, BessEvent, BessState, Telemetry, TelemetryValue, tick_asset};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -447,7 +447,23 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         energy_out_mwh: t.energy_out_mwh,
         available_charge_kw: t.available_charge_kw,
         available_discharge_kw: t.available_discharge_kw,
+        extras: t
+            .extras
+            .iter()
+            .filter_map(|(key, value)| telemetry_value_to_proto(value).map(|v| (key.clone(), v)))
+            .collect(),
     }
+}
+
+fn telemetry_value_to_proto(value: &TelemetryValue) -> Option<proto::TelemetryValue> {
+    let value = match value {
+        TelemetryValue::F64(v) => proto::telemetry_value::Value::F64(*v),
+        TelemetryValue::I64(v) => proto::telemetry_value::Value::I64(*v),
+        TelemetryValue::U64(v) => proto::telemetry_value::Value::U64(*v),
+        TelemetryValue::Bool(v) => proto::telemetry_value::Value::Bool(*v),
+        TelemetryValue::String(v) => proto::telemetry_value::Value::String(v.clone()),
+    };
+    Some(proto::TelemetryValue { value: Some(value) })
 }
 
 fn to_proto_event(e: &BessEvent) -> ProtoEvent {
@@ -512,6 +528,7 @@ fn telemetry_from_opcua(asset: &Asset, sim: &BessState, sample: OpcUaTelemetrySa
         available_discharge_kw: sample
             .available_discharge_kw
             .unwrap_or(available_discharge_kw),
+        extras: sample.extras,
     }
 }
 
@@ -1021,6 +1038,7 @@ struct TelemetryNodes {
     energy_out_mwh: Option<NodeId>,
     available_charge_kw: Option<NodeId>,
     available_discharge_kw: Option<NodeId>,
+    extras: std::collections::HashMap<String, NodeId>,
 }
 
 impl TelemetryNodes {
@@ -1067,8 +1085,20 @@ impl TelemetryNodes {
                 .available_discharge_kw
                 .clone()
                 .or_else(|| defaults.available_discharge_kw.clone()),
+            extras: merge_optional_maps(&defaults.extras, &self.extras),
         }
     }
+}
+
+fn merge_optional_maps(
+    defaults: &std::collections::HashMap<String, NodeId>,
+    overrides: &std::collections::HashMap<String, NodeId>,
+) -> std::collections::HashMap<String, NodeId> {
+    let mut merged = defaults.clone();
+    for (key, value) in overrides {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -1130,6 +1160,8 @@ struct OpcUaTelemetryMap {
     available_charge_kw: Option<String>,
     #[serde(default)]
     available_discharge_kw: Option<String>,
+    #[serde(flatten)]
+    extras: std::collections::HashMap<String, String>,
 }
 
 impl OpcUaConfig {
@@ -1208,6 +1240,7 @@ impl OpcUaConfig {
             available_discharge_kw: std::env::var("OPCUA_NODE_AVAILABLE_DISCHARGE_KW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            extras: std::collections::HashMap::new(),
         };
         let telemetry_interval = std::env::var("OPCUA_TELEMETRY_INTERVAL_S")
             .ok()
@@ -1407,6 +1440,14 @@ impl OpcUaConfig {
             None => None,
         };
 
+        let mut extras = std::collections::HashMap::new();
+        for (key, node) in map.extras.iter() {
+            let parsed: NodeId = node
+                .parse()
+                .map_err(|e| anyhow!("bad telemetry {} node {}: {e:?}", key, node))?;
+            extras.insert(key.clone(), parsed);
+        }
+
         Ok(TelemetryNodes {
             current_mw,
             soc_pct,
@@ -1425,6 +1466,7 @@ impl OpcUaConfig {
             energy_out_mwh,
             available_charge_kw,
             available_discharge_kw,
+            extras,
         })
     }
 }
@@ -1810,6 +1852,7 @@ impl OpcUaClient {
             || nodes.energy_out_mwh.is_some()
             || nodes.available_charge_kw.is_some()
             || nodes.available_discharge_kw.is_some()
+            || !nodes.extras.is_empty()
     }
 
     fn telemetry_write_sim_enabled(&self) -> bool {
@@ -2130,6 +2173,23 @@ impl OpcUaClient {
                 },
             });
         }
+        for (key, node) in nodes.extras.iter() {
+            let Some(value) = snap.extras.get(key) else { continue; };
+            let Some(variant) = telemetry_value_to_variant(value) else { continue; };
+            writes.push(WriteValue {
+                node_id: node.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(variant),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
 
         if writes.is_empty() {
             return Ok(());
@@ -2314,6 +2374,15 @@ impl OpcUaClient {
             });
             fields.push(OpcUaField::AvailableDischargeKw);
         }
+        for (key, node) in nodes.extras.iter() {
+            read_ids.push(ReadValueId {
+                node_id: node.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::Extra(key.clone()));
+        }
 
         if read_ids.is_empty() {
             return Ok(None);
@@ -2365,6 +2434,11 @@ impl OpcUaClient {
                 }
                 OpcUaField::AvailableDischargeKw => {
                     sample.available_discharge_kw = value.and_then(variant_to_f64)
+                }
+                OpcUaField::Extra(key) => {
+                    if let Some(value) = value.and_then(variant_to_telemetry_value) {
+                        sample.extras.insert(key.clone(), value);
+                    }
                 }
             }
         }
@@ -2601,6 +2675,7 @@ struct OpcUaTelemetrySample {
     energy_out_mwh: Option<f64>,
     available_charge_kw: Option<f64>,
     available_discharge_kw: Option<f64>,
+    extras: std::collections::HashMap<String, TelemetryValue>,
 }
 
 #[derive(Debug)]
@@ -2622,6 +2697,7 @@ enum OpcUaField {
     EnergyOutMwh,
     AvailableChargeKw,
     AvailableDischargeKw,
+    Extra(String),
 }
 
 fn variant_to_f64(value: &Variant) -> Option<f64> {
@@ -2652,5 +2728,29 @@ fn variant_to_string(value: &Variant) -> Option<String> {
     match value {
         Variant::String(v) => Some(v.to_string()),
         _ => None,
+    }
+}
+
+fn variant_to_telemetry_value(value: &Variant) -> Option<TelemetryValue> {
+    match value {
+        Variant::Double(v) => Some(TelemetryValue::F64(*v)),
+        Variant::Float(v) => Some(TelemetryValue::F64(*v as f64)),
+        Variant::Int64(v) => Some(TelemetryValue::I64(*v)),
+        Variant::Int32(v) => Some(TelemetryValue::I64(*v as i64)),
+        Variant::UInt64(v) => Some(TelemetryValue::U64(*v)),
+        Variant::UInt32(v) => Some(TelemetryValue::U64(*v as u64)),
+        Variant::Boolean(v) => Some(TelemetryValue::Bool(*v)),
+        Variant::String(v) => Some(TelemetryValue::String(v.to_string())),
+        _ => None,
+    }
+}
+
+fn telemetry_value_to_variant(value: &TelemetryValue) -> Option<Variant> {
+    match value {
+        TelemetryValue::F64(v) => Some(Variant::Double(*v)),
+        TelemetryValue::I64(v) => Some(Variant::Int64(*v)),
+        TelemetryValue::U64(v) => Some(Variant::UInt64(*v)),
+        TelemetryValue::Bool(v) => Some(Variant::Boolean(*v)),
+        TelemetryValue::String(v) => Some(Variant::String(v.clone().into())),
     }
 }

@@ -11,6 +11,26 @@ DEFAULT_SSOT_PATH = ROOT / "ignition_ssot.json"
 DEFAULT_OPCUA_MAP_DIR = ROOT / "der_headend"
 DEFAULT_ASSETS_TEST_OUTPUT = ROOT / "der_headend" / "assets_test.yaml"
 DEFAULT_IGNITION_TAGS_OUTPUT = ROOT / "ignition_tags.json"
+DEFAULT_TELEMETRY_SCHEMA = [
+    {"name": "soc_pct", "type": "f64", "source": "opcua"},
+    {"name": "soc_mwhr", "type": "f64", "source": "opcua"},
+    {"name": "current_mw", "type": "f64", "source": "opcua"},
+    {"name": "setpoint_mw", "type": "f64", "source": "computed"},
+    {"name": "status", "type": "string", "source": "opcua"},
+    {"name": "voltage_v", "type": "f64", "source": "opcua"},
+    {"name": "current_a", "type": "f64", "source": "opcua"},
+    {"name": "dc_bus_v", "type": "f64", "source": "opcua"},
+    {"name": "dc_bus_a", "type": "f64", "source": "opcua"},
+    {"name": "temperature_cell_f", "type": "f64", "source": "opcua"},
+    {"name": "temperature_module_f", "type": "f64", "source": "opcua"},
+    {"name": "temperature_ambient_f", "type": "f64", "source": "opcua"},
+    {"name": "soh_pct", "type": "f64", "source": "opcua"},
+    {"name": "cycle_count", "type": "u64", "source": "opcua"},
+    {"name": "energy_in_mwh", "type": "f64", "source": "opcua"},
+    {"name": "energy_out_mwh", "type": "f64", "source": "opcua"},
+    {"name": "available_charge_kw", "type": "f64", "source": "opcua"},
+    {"name": "available_discharge_kw", "type": "f64", "source": "opcua"},
+]
 
 
 def load_ssot(path):
@@ -48,34 +68,65 @@ def validate_ssot(ssot, strict=True):
                 "site %s opcua config missing keys: %s"
                 % (site.get("id"), ", ".join(missing))
             )
+    telemetry_schema = ssot.get("telemetry_schema") or []
+    if telemetry_schema:
+        seen = set()
+        for entry in telemetry_schema:
+            name = entry.get("name")
+            field_type = entry.get("type")
+            if not name or not field_type:
+                errors.append("telemetry_schema entries require name and type")
+                continue
+            if name in seen:
+                errors.append("telemetry_schema has duplicate field %s" % name)
+            seen.add(name)
+            source = entry.get("source", "opcua")
+            if source not in ("opcua", "computed"):
+                errors.append(
+                    "telemetry_schema field %s has invalid source %s"
+                    % (name, source)
+                )
     if errors:
         msg = "validation failed:\\n- " + "\\n- ".join(errors)
         if strict:
             raise ValueError(msg)
         print("WARNING:", msg)
 
+def telemetry_schema_from_ssot(ssot):
+    schema = ssot.get("telemetry_schema")
+    if not schema:
+        return DEFAULT_TELEMETRY_SCHEMA
+    fields = []
+    for entry in schema:
+        name = entry.get("name")
+        field_type = entry.get("type")
+        source = entry.get("source", "opcua")
+        if not name or not field_type:
+            raise ValueError("telemetry_schema entries require name and type")
+        fields.append({"name": name, "type": field_type, "source": source})
+    return fields
 
-def asset_folder(asset_name, read_only=False):
-    telemetry_tags = [
-        atomic_tag("soc_pct", "Float4", 0, read_only),
-        atomic_tag("soc_mwhr", "Float4", 0, read_only),
-        atomic_tag("current_mw", "Float4", 0, read_only),
-        atomic_tag("setpoint_mw", "Float4", 0, read_only),
-        atomic_tag("status", "String", "", read_only),
-        atomic_tag("voltage_v", "Float4", 0, read_only),
-        atomic_tag("current_a", "Float4", 0, read_only),
-        atomic_tag("dc_bus_v", "Float4", 0, read_only),
-        atomic_tag("dc_bus_a", "Float4", 0, read_only),
-        atomic_tag("temperature_cell_f", "Float4", 0, read_only),
-        atomic_tag("temperature_module_f", "Float4", 0, read_only),
-        atomic_tag("temperature_ambient_f", "Float4", 0, read_only),
-        atomic_tag("soh_pct", "Float4", 0, read_only),
-        atomic_tag("cycle_count", "Int8", 0, read_only),
-        atomic_tag("energy_in_mwh", "Float4", 0, read_only),
-        atomic_tag("energy_out_mwh", "Float4", 0, read_only),
-        atomic_tag("available_charge_kw", "Float4", 0, read_only),
-        atomic_tag("available_discharge_kw", "Float4", 0, read_only),
-    ]
+def ignition_type_for_schema(field_type):
+    field_type = str(field_type).lower()
+    if field_type in ("f64", "float", "double", "number"):
+        return "Float4", 0
+    if field_type in ("i64", "int64", "integer", "int"):
+        return "Int8", 0
+    if field_type in ("u64", "uint64", "uint"):
+        return "Int8", 0
+    if field_type in ("bool", "boolean"):
+        return "Boolean", False
+    if field_type in ("string", "str"):
+        return "String", ""
+    return "Float4", 0
+
+def asset_folder(asset_name, telemetry_schema, read_only=False):
+    telemetry_tags = []
+    for field in telemetry_schema:
+        data_type, default_value = ignition_type_for_schema(field["type"])
+        telemetry_tags.append(
+            atomic_tag(field["name"], data_type, default_value, read_only)
+        )
     control_tags = [
         atomic_tag("setpoint_mw", "Float4", 0, read_only),
         atomic_tag("duration_s", "Int4", 0, read_only),
@@ -113,8 +164,11 @@ def atomic_tag(name, data_type, value, read_only):
     }
 
 
-def write_ignition_tags(assets, output_path):
-    root = folder_tag("Assets", [asset_folder(a["name"], read_only=False) for a in assets])
+def write_ignition_tags(assets, telemetry_schema, output_path):
+    root = folder_tag(
+        "Assets",
+        [asset_folder(a["name"], telemetry_schema, read_only=False) for a in assets],
+    )
     payload = {
         "meta": {
             "generated_by": "tools/generate_ignition_files.py",
@@ -175,7 +229,7 @@ def slugify(value):
     return "".join(out) or "site"
 
 
-def build_opcua_map_data(site, opcua_cfg, assets):
+def build_opcua_map_data(site, opcua_cfg, assets, telemetry_schema):
     map_name = opcua_cfg.get("map_name") or site["name"]
     map_slug = slugify(map_name)
 
@@ -200,6 +254,11 @@ def build_opcua_map_data(site, opcua_cfg, assets):
         "telemetry_write_sim": opcua_cfg["telemetry_write_sim"],
         "default_setpoint_asset": default_asset,
         "site_assets": site_assets,
+        "telemetry_fields": [
+            field["name"]
+            for field in telemetry_schema
+            if field.get("source", "opcua") == "opcua"
+        ],
     }
 
 
@@ -245,25 +304,7 @@ def write_opcua_map(map_data, output_dir):
     lines.append("telemetry_assets:")
     for asset in map_data["site_assets"]:
         lines.append("  \"%s\":" % asset["id"])
-        for key in (
-            "current_mw",
-            "soc_pct",
-            "soc_mwhr",
-            "status",
-            "voltage_v",
-            "current_a",
-            "dc_bus_v",
-            "dc_bus_a",
-            "temperature_cell_f",
-            "temperature_module_f",
-            "temperature_ambient_f",
-            "soh_pct",
-            "cycle_count",
-            "energy_in_mwh",
-            "energy_out_mwh",
-            "available_charge_kw",
-            "available_discharge_kw",
-        ):
+        for key in map_data["telemetry_fields"]:
             lines.append(
                 "    %s: %s"
                 % (
@@ -281,36 +322,18 @@ def write_opcua_map(map_data, output_dir):
     return output_path
 
 
-def collect_tag_rows(assets):
+def collect_tag_rows(assets, telemetry_schema):
     rows = []
     rows.append(("Assets", "Folder", None, None, None, None))
     for asset in assets:
         asset_root = "Assets/%s" % asset["name"]
         rows.append((asset_root, "Folder", None, None, None, None))
+        telemetry_tags = []
+        for field in telemetry_schema:
+            data_type, default_value = ignition_type_for_schema(field["type"])
+            telemetry_tags.append((field["name"], data_type, default_value, False))
         for group, tags in (
-            (
-                "telemetry",
-                [
-                    ("soc_pct", "Float4", 0, False),
-                    ("soc_mwhr", "Float4", 0, False),
-                    ("current_mw", "Float4", 0, False),
-                    ("setpoint_mw", "Float4", 0, False),
-                    ("status", "String", "", False),
-                    ("voltage_v", "Float4", 0, False),
-                    ("current_a", "Float4", 0, False),
-                    ("dc_bus_v", "Float4", 0, False),
-                    ("dc_bus_a", "Float4", 0, False),
-                    ("temperature_cell_f", "Float4", 0, False),
-                    ("temperature_module_f", "Float4", 0, False),
-                    ("temperature_ambient_f", "Float4", 0, False),
-                    ("soh_pct", "Float4", 0, False),
-                    ("cycle_count", "Int8", 0, False),
-                    ("energy_in_mwh", "Float4", 0, False),
-                    ("energy_out_mwh", "Float4", 0, False),
-                    ("available_charge_kw", "Float4", 0, False),
-                    ("available_discharge_kw", "Float4", 0, False),
-                ],
-            ),
+            ("telemetry", telemetry_tags),
             (
                 "control",
                 [
@@ -338,7 +361,7 @@ def collect_tag_rows(assets):
     return rows
 
 
-def write_duckdb(output_dir, sites, assets, map_data_list):
+def write_duckdb(output_dir, sites, assets, map_data_list, telemetry_schema):
     try:
         import duckdb  # type: ignore
     except ImportError as exc:
@@ -604,25 +627,7 @@ def write_duckdb(output_dir, sites, assets, map_data_list):
                     ),
                 )
             )
-            for field in (
-                "current_mw",
-                "soc_pct",
-                "soc_mwhr",
-                "status",
-                "voltage_v",
-                "current_a",
-                "dc_bus_v",
-                "dc_bus_a",
-                "temperature_cell_f",
-                "temperature_module_f",
-                "temperature_ambient_f",
-                "soh_pct",
-                "cycle_count",
-                "energy_in_mwh",
-                "energy_out_mwh",
-                "available_charge_kw",
-                "available_discharge_kw",
-            ):
+            for field in map_data["telemetry_fields"]:
                 telemetry_rows.append(
                     (
                         map_data["map_name"],
@@ -645,7 +650,7 @@ def write_duckdb(output_dir, sites, assets, map_data_list):
             telemetry_rows,
         )
 
-    tag_rows = collect_tag_rows(assets)
+    tag_rows = collect_tag_rows(assets, telemetry_schema)
     con.executemany(
         "INSERT INTO ignition_tags VALUES (?, ?, ?, ?, ?, ?)",
         tag_rows,
@@ -700,6 +705,7 @@ def main():
     validate_ssot(ssot, strict=strict)
     sites = ssot["sites"]
     assets = ssot["assets"]
+    telemetry_schema = telemetry_schema_from_ssot(ssot)
 
     if args.output_dir:
         output_dir = Path(args.output_dir).expanduser().resolve()
@@ -713,7 +719,7 @@ def main():
     ignition_tags_output = output_dir / DEFAULT_IGNITION_TAGS_OUTPUT.name
     assets_test_output = opcua_output_dir / DEFAULT_ASSETS_TEST_OUTPUT.name
 
-    write_ignition_tags(assets, ignition_tags_output)
+    write_ignition_tags(assets, telemetry_schema, ignition_tags_output)
     write_assets_test(sites, assets, assets_test_output)
 
     map_data_list = []
@@ -721,7 +727,7 @@ def main():
         opcua_cfg = site.get("opcua")
         if not opcua_cfg:
             continue
-        map_data = build_opcua_map_data(site, opcua_cfg, assets)
+        map_data = build_opcua_map_data(site, opcua_cfg, assets, telemetry_schema)
         output_path = write_opcua_map(map_data, opcua_output_dir)
         map_data["output_path"] = output_path
         map_data_list.append(map_data)
@@ -738,7 +744,7 @@ def main():
             tar.add(path, arcname="der_headend/%s" % path.name)
 
     if not args.skip_duckdb:
-        write_duckdb(output_dir, sites, assets, map_data_list)
+        write_duckdb(output_dir, sites, assets, map_data_list, telemetry_schema)
 
 
 if __name__ == "__main__":

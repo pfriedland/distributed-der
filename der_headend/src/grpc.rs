@@ -8,7 +8,7 @@ use tokio_stream::{StreamExt as TokioStreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response as GrpcResponse, Status};
 use uuid::Uuid;
 
-use sim_core::{Asset, BessEvent, BessState, Dispatch, Telemetry, tick_asset};
+use sim_core::{Asset, BessEvent, BessState, Dispatch, Telemetry, TelemetryValue, tick_asset};
 
 use crate::{
     AppState,
@@ -348,6 +348,7 @@ async fn handle_agent_telemetry(state: &AppState, t: crate::proto::Telemetry) ->
         energy_out_mwh: t.energy_out_mwh,
         available_charge_kw: t.available_charge_kw,
         available_discharge_kw: t.available_discharge_kw,
+        extras: proto_extras_to_map(&t.extras),
     };
 
     {
@@ -392,6 +393,11 @@ fn telemetry_to_proto(snap: &Telemetry) -> crate::proto::Telemetry {
         energy_out_mwh: snap.energy_out_mwh,
         available_charge_kw: snap.available_charge_kw,
         available_discharge_kw: snap.available_discharge_kw,
+        extras: snap
+            .extras
+            .iter()
+            .filter_map(|(key, value)| telemetry_value_to_proto(value).map(|v| (key.clone(), v)))
+            .collect(),
     }
 }
 
@@ -468,7 +474,8 @@ async fn build_bootstrap_response(
                     energy_in_mwh,
                     energy_out_mwh,
                     available_charge_kw,
-                    available_discharge_kw
+                    available_discharge_kw,
+                    extras
                 FROM telemetry
                 WHERE asset_id = ANY($1)
                 ORDER BY asset_id, ts DESC
@@ -507,6 +514,7 @@ async fn build_bootstrap_response(
                         energy_out_mwh: row.energy_out_mwh,
                         available_charge_kw: row.available_charge_kw,
                         available_discharge_kw: row.available_discharge_kw,
+                        extras: row.extras.0,
                     },
                 );
             }
@@ -597,6 +605,39 @@ async fn build_bootstrap_response(
     }
 
     Ok(BootstrapResponse { assets })
+}
+
+fn telemetry_value_to_proto(value: &TelemetryValue) -> Option<crate::proto::TelemetryValue> {
+    let value = match value {
+        TelemetryValue::F64(v) => crate::proto::telemetry_value::Value::F64(*v),
+        TelemetryValue::I64(v) => crate::proto::telemetry_value::Value::I64(*v),
+        TelemetryValue::U64(v) => crate::proto::telemetry_value::Value::U64(*v),
+        TelemetryValue::Bool(v) => crate::proto::telemetry_value::Value::Bool(*v),
+        TelemetryValue::String(v) => crate::proto::telemetry_value::Value::String(v.clone()),
+    };
+    Some(crate::proto::TelemetryValue {
+        value: Some(value),
+    })
+}
+
+fn proto_extras_to_map(
+    extras: &std::collections::HashMap<String, crate::proto::TelemetryValue>,
+) -> std::collections::HashMap<String, TelemetryValue> {
+    let mut map = std::collections::HashMap::new();
+    for (key, value) in extras {
+        let Some(kind) = value.value.as_ref() else { continue; };
+        let converted = match kind {
+            crate::proto::telemetry_value::Value::F64(v) => TelemetryValue::F64(*v),
+            crate::proto::telemetry_value::Value::I64(v) => TelemetryValue::I64(*v),
+            crate::proto::telemetry_value::Value::U64(v) => TelemetryValue::U64(*v),
+            crate::proto::telemetry_value::Value::Bool(v) => TelemetryValue::Bool(*v),
+            crate::proto::telemetry_value::Value::String(v) => {
+                TelemetryValue::String(v.clone())
+            }
+        };
+        map.insert(key.clone(), converted);
+    }
+    map
 }
 
 async fn handle_agent_heartbeat(state: &AppState, hb: crate::proto::Heartbeat) -> Result<()> {

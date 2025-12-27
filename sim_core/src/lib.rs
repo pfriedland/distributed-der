@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -26,6 +27,16 @@ pub struct BessState {
     pub soc_mwhr: f64,
     pub current_mw: f64,
     pub setpoint_mw: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum TelemetryValue {
+    F64(f64),
+    I64(i64),
+    U64(u64),
+    Bool(bool),
+    String(String),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -68,6 +79,8 @@ pub struct Telemetry {
     pub available_charge_kw: f64,
     #[serde(default)]
     pub available_discharge_kw: f64,
+    #[serde(default)]
+    pub extras: HashMap<String, TelemetryValue>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -173,6 +186,7 @@ pub fn tick_asset(asset: &Asset, state: &mut BessState, dt_secs: f64) -> Telemet
         energy_out_mwh: 0.0,
         available_charge_kw: (-asset.min_mw).max(0.0) * 1000.0,
         available_discharge_kw: asset.max_mw.max(0.0) * 1000.0,
+        extras: HashMap::new(),
     }
 }
 

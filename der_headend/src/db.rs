@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sim_core::{Asset, BessEvent, Dispatch, Telemetry};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, postgres::PgPoolOptions, types::Json};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -97,7 +97,8 @@ pub async fn init_db(pool: &PgPool) -> Result<()> {
             energy_in_mwh double precision NOT NULL DEFAULT 0,
             energy_out_mwh double precision NOT NULL DEFAULT 0,
             available_charge_kw double precision NOT NULL DEFAULT 0,
-            available_discharge_kw double precision NOT NULL DEFAULT 0
+            available_discharge_kw double precision NOT NULL DEFAULT 0,
+            extras jsonb NOT NULL DEFAULT '{}'::jsonb
         );
     "#,
     )
@@ -157,6 +158,10 @@ pub async fn init_db(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("altering telemetry.available_discharge_kw")?;
+    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS extras jsonb NOT NULL DEFAULT '{}'::jsonb;"#)
+        .execute(pool)
+        .await
+        .context("altering telemetry.extras")?;
 
     try_setup_timescale(pool).await;
 
@@ -239,8 +244,8 @@ pub async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()>
                 voltage_v, current_a, dc_bus_v, dc_bus_a,
                 temperature_cell_f, temperature_module_f, temperature_ambient_f,
                 soh_pct, cycle_count, energy_in_mwh, energy_out_mwh,
-                available_charge_kw, available_discharge_kw
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+                available_charge_kw, available_discharge_kw, extras
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         "#,
         )
         .bind(snap.asset_id)
@@ -267,6 +272,7 @@ pub async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()>
         .bind(snap.energy_out_mwh)
         .bind(snap.available_charge_kw)
         .bind(snap.available_discharge_kw)
+        .bind(Json(&snap.extras))
         .execute(pool)
         .await
         .context("inserting telemetry row")?;

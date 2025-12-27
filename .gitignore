@@ -6,3 +6,7 @@ archive
 *.bk*
 .venv*
 .env*
+*.duckdb
+*.db
+*.gz
+.tar
