@@ -25,6 +25,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use tonic::codec::CompressionEncoding;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
@@ -464,7 +465,11 @@ async fn main() -> Result<()> {
     let grpc_state = state.clone();
     let http = axum::serve(tokio::net::TcpListener::bind(http_addr).await?, app);
     let grpc = Server::builder()
-        .add_service(AgentLinkServer::new(GrpcApi { state: grpc_state }))
+        .add_service(
+            AgentLinkServer::new(GrpcApi { state: grpc_state })
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
+        )
         .serve(grpc_addr);
 
     tracing::info!(

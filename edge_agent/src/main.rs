@@ -7,10 +7,20 @@
 //! - Push telemetry upstream; receive setpoints on the same stream.
 //! - Configuration comes from env vars: ASSET_ID, SITE_ID, HEADEND_GRPC, plus asset params (and optional gateway mode vars).
 
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use futures_util::StreamExt;
 use opcua::client::prelude::{
     AttributeService,
@@ -25,6 +35,7 @@ use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use prost::Message;
 
 pub mod proto {
     tonic::include_proto!("agent");
@@ -34,6 +45,7 @@ use proto::{
     Event as ProtoEvent, Heartbeat, Register, Setpoint, agent_link_client::AgentLinkClient,
     agent_to_headend, headend_to_agent,
 };
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 
 #[derive(Clone)]
@@ -43,6 +55,44 @@ struct AppState {
     headend_grpc: String,
     gateway_id: String,
     opcua: Option<Arc<OpcUaClient>>,
+    grpc_stats: Arc<GrpcStats>,
+}
+
+struct GrpcStats {
+    sent_bytes: AtomicU64,
+    sent_messages: AtomicU64,
+    sent_gzip_bytes: AtomicU64,
+    sent_gzip_raw_bytes: AtomicU64,
+}
+
+impl GrpcStats {
+    fn new() -> Self {
+        Self {
+            sent_bytes: AtomicU64::new(0),
+            sent_messages: AtomicU64::new(0),
+            sent_gzip_bytes: AtomicU64::new(0),
+            sent_gzip_raw_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn record_telemetry(&self, msg: &proto::Telemetry) {
+        let raw_len = msg.encoded_len() as u64;
+        self.sent_bytes.fetch_add(raw_len, Ordering::Relaxed);
+        self.sent_messages.fetch_add(1, Ordering::Relaxed);
+
+        let raw = msg.encode_to_vec();
+        if let Ok(gz_len) = estimate_gzip_len(&raw) {
+            self.sent_gzip_bytes.fetch_add(gz_len as u64, Ordering::Relaxed);
+            self.sent_gzip_raw_bytes.fetch_add(raw_len, Ordering::Relaxed);
+        }
+    }
+}
+
+fn estimate_gzip_len(data: &[u8]) -> std::io::Result<usize> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data)?;
+    let out = encoder.finish()?;
+    Ok(out.len())
 }
 
 #[derive(Clone)]
@@ -68,22 +118,62 @@ async fn main() -> Result<()> {
     let cfg = AgentConfig::from_env()?;
     let (primary_asset_id, assets_map) = build_assets_map(&cfg);
     let opcua = cfg.opcua.clone().map(OpcUaClient::new).map(Arc::new);
+    let grpc_stats = Arc::new(GrpcStats::new());
     let state = AppState {
         headend_grpc: cfg.headend_grpc.clone(),
         assets: Arc::new(RwLock::new(assets_map)),
         gateway_id: cfg.gateway_id.clone(),
         opcua,
+        grpc_stats: grpc_stats.clone(),
     };
+
+    spawn_grpc_stats_logger(grpc_stats);
 
     // Start the tick + gRPC stream in the background.
     run_grpc_loop(state.clone(), primary_asset_id).await?;
     Ok(())
 }
 
+fn spawn_grpc_stats_logger(stats: Arc<GrpcStats>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let bytes = stats.sent_bytes.swap(0, Ordering::Relaxed);
+            let msgs = stats.sent_messages.swap(0, Ordering::Relaxed);
+            let gz_bytes = stats.sent_gzip_bytes.swap(0, Ordering::Relaxed);
+            let raw_bytes = stats.sent_gzip_raw_bytes.swap(0, Ordering::Relaxed);
+            if msgs == 0 {
+                continue;
+            }
+            let kbps = (bytes as f64) / 1024.0 / 60.0;
+            let compression = if raw_bytes > 0 {
+                100.0 * (1.0 - (gz_bytes as f64 / raw_bytes as f64))
+            } else {
+                0.0
+            };
+            tracing::info!(
+                "grpc telemetry tx msgs={} bytes={} kbps={:.2} gzip_savings={:.1}%",
+                msgs,
+                bytes,
+                kbps,
+                compression
+            );
+        }
+    });
+}
+
 async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
     loop {
-        match AgentLinkClient::connect(state.headend_grpc.clone()).await {
-            Ok(mut client) => {
+        match Channel::from_shared(state.headend_grpc.clone())
+            .with_context(|| format!("invalid HEADEND_GRPC {}", state.headend_grpc))?
+            .connect()
+            .await
+        {
+            Ok(channel) => {
+                let mut client = AgentLinkClient::new(channel)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip);
                 if let Err(err) = bootstrap_from_headend(&state, &mut client).await {
                     tracing::warn!("bootstrap failed: {err}");
                 }
@@ -207,11 +297,11 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
         } else {
             maybe_generate_events(&state, &asset, &snap).await
                                 };
+                                let proto_snap = to_proto_telemetry(&snap);
+                                state.grpc_stats.record_telemetry(&proto_snap);
                                 if tx
                                     .send(AgentToHeadend {
-                                        msg: Some(agent_to_headend::Msg::Telemetry(
-                                            to_proto_telemetry(&snap),
-                                        )),
+                                        msg: Some(agent_to_headend::Msg::Telemetry(proto_snap)),
                                     })
                                     .await
                                     .is_err()

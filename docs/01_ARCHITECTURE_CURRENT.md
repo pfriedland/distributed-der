@@ -96,6 +96,9 @@ It is intentionally split into a lightweight **headend** (control plane) and one
 ## Data flows and interfaces
 - Telemetry:
   - `edge_agent` → (gRPC stream) → `der_headend` → (optional DB + in-memory latest)
+  - Source of telemetry:
+    - If OPC UA nodes are configured and `telemetry_write_sim=false`, the agent **reads telemetry from OPC UA**.
+    - Otherwise the agent **simulates telemetry** and may write it to OPC UA when `telemetry_write_sim=true`.
 - Dispatch:
   - client → (REST `/dispatch`) → `der_headend` → (gRPC `Setpoint`) → `edge_agent`
   - In Gateway Mode, `site_id` dispatch triggers a split policy inside `edge_agent`.
