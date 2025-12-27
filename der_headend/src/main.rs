@@ -1334,6 +1334,8 @@ async fn init_db(pool: &PgPool) -> Result<()> {
         .await
         .context("altering telemetry.available_discharge_kw")?;
 
+    try_setup_timescale(pool).await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -1430,6 +1432,40 @@ async fn init_db(pool: &PgPool) -> Result<()> {
     .await
     .context("creating events table")?;
     Ok(())
+}
+
+async fn try_setup_timescale(pool: &PgPool) {
+    if let Err(err) = sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS timescaledb;"#)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!("timescaledb extension unavailable: {err}");
+        return;
+    }
+
+    if let Err(err) = sqlx::query(
+        r#"
+        SELECT create_hypertable('telemetry', 'ts', if_not_exists => TRUE);
+        "#,
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::warn!("failed to convert telemetry to hypertable: {err}");
+        return;
+    }
+
+    if let Err(err) = sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS telemetry_asset_ts_idx
+        ON telemetry (asset_id, ts DESC);
+        "#,
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::warn!("failed to create telemetry index: {err}");
+    }
 }
 
 async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()> {
