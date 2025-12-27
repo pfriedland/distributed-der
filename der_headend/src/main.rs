@@ -29,7 +29,7 @@ use tonic::codec::CompressionEncoding;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Dispatch, DispatchRequest, Telemetry, tick_asset};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::{StreamExt as TokioStreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response as GrpcResponse, Status, transport::Server};
@@ -40,11 +40,23 @@ use uuid::Uuid;
 pub mod proto {
     tonic::include_proto!("agent");
 }
+mod db;
+mod models;
 use proto::{
     AgentToHeadend, AssetBootstrap, BootstrapRequest, BootstrapResponse, DispatchAck,
     Event as ProtoEvent, HeadendToAgent, Register, Setpoint,
     agent_link_server::{AgentLink, AgentLinkServer},
     agent_to_headend, headend_to_agent,
+};
+
+use crate::db::{
+    maybe_connect_db, persist_assets, persist_dispatch, persist_event, persist_heartbeat,
+    persist_telemetry, record_agent_connect, record_agent_disconnect,
+};
+use crate::models::{
+    AssetCfg, AssetView, AssetsFile, DispatchSnapshotRow, HeartbeatRow, IncomingDispatch,
+    SiteAccumulator, SiteAggregateBuilder, SiteCfg, SiteView, TelemetryRow, TelemetrySeed,
+    TelemetrySnapshotRow, TimeRange,
 };
 
 #[derive(Clone)]
@@ -205,50 +217,6 @@ fn soc_bounds(asset: &Asset) -> (f64, f64) {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct AssetsFile {
-    sites: Vec<SiteCfg>,
-    assets: Vec<AssetCfg>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SiteCfg {
-    id: Uuid,
-    name: String,
-    location: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssetCfg {
-    id: Uuid,
-    site_id: Uuid,
-    name: String,
-    capacity_mwhr: f64,
-    max_mw: f64,
-    min_mw: f64,
-    #[serde(default = "default_min_soc_pct")]
-    min_soc_pct: f64,
-    #[serde(default = "default_max_soc_pct")]
-    max_soc_pct: f64,
-    efficiency: f64,
-    ramp_rate_mw_per_min: f64,
-}
-
-fn default_min_soc_pct() -> f64 {
-    0.0
-}
-
-fn default_max_soc_pct() -> f64 {
-    100.0
-}
-
-#[derive(sqlx::FromRow)]
-struct TelemetrySeed {
-    asset_id: Uuid,
-    soc_mwhr: f64,
-    current_mw: f64,
-    setpoint_mw: f64,
-}
 
 async fn load_assets_from_yaml() -> Result<Vec<Asset>> {
     // Read the YAML file and map site/asset records into `sim_core::Asset`.
@@ -597,6 +565,7 @@ impl AgentLink for GrpcApi {
                                     Uuid::parse_str(&site_id).unwrap_or_else(|_| Uuid::nil())
                                 };
 
+                                let connected_at = Utc::now();
                                 state.agent_streams.write().await.insert(
                                     uuid,
                                     AgentStream {
@@ -605,7 +574,7 @@ impl AgentLink for GrpcApi {
                                         asset_name: asset_name.clone(),
                                         site_name: site_name.clone(),
                                         site_id: site_uuid,
-                                        connected_at: Utc::now(),
+                                        connected_at,
                                     },
                                 );
                                 asset_ids.push((uuid, asset_name.clone(), site_name.clone()));
@@ -626,6 +595,7 @@ impl AgentLink for GrpcApi {
                                         &peer_ip,
                                         &asset_name,
                                         &site_name,
+                                        connected_at,
                                     )
                                     .await
                                     {
@@ -657,6 +627,7 @@ impl AgentLink for GrpcApi {
                             if let Ok(uuid) = Uuid::parse_str(&id) {
                                 let site_uuid =
                                     Uuid::parse_str(&site_id).unwrap_or_else(|_| Uuid::nil());
+                                let connected_at = Utc::now();
                                 state.agent_streams.write().await.insert(
                                     uuid,
                                     AgentStream {
@@ -665,7 +636,7 @@ impl AgentLink for GrpcApi {
                                         asset_name: asset_name.clone(),
                                         site_name: site_name.clone(),
                                         site_id: site_uuid,
-                                        connected_at: Utc::now(),
+                                        connected_at,
                                     },
                                 );
                                 asset_ids.push((uuid, asset_name.clone(), site_name.clone()));
@@ -685,6 +656,7 @@ impl AgentLink for GrpcApi {
                                         &peer_ip,
                                         &asset_name,
                                         &site_name,
+                                        connected_at,
                                     )
                                     .await
                                     {
@@ -1103,16 +1075,6 @@ async fn handle_dispatch_ack(state: &AppState, ack: DispatchAck) -> Result<()> {
     Ok(())
 }
 
-fn env_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
-        }
-        Err(_) => false,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocState {
     BelowMin,
@@ -1183,433 +1145,6 @@ async fn handle_agent_event(state: &AppState, evt: ProtoEvent) -> Result<()> {
     if let Some(db) = state.db.as_ref() {
         persist_event(db, &event).await?;
     }
-    Ok(())
-}
-
-async fn reset_db(pool: &PgPool) -> Result<()> {
-    // TRUNCATE is fast and keeps table definitions intact.
-    // NOTE: there are no foreign keys today, but CASCADE keeps this resilient if you add them later.
-    sqlx::query(
-        r#"
-        TRUNCATE TABLE
-            telemetry,
-            agent_sessions,
-            dispatches,
-            heartbeats,
-            events,
-            assets
-        CASCADE
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("resetting database tables")?;
-    Ok(())
-}
-
-async fn maybe_connect_db() -> Result<Option<PgPool>> {
-    // DATABASE_URL is optional; if not set we run in-memory only.
-    let url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return Ok(None),
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .context("connecting to DATABASE_URL")?;
-    init_db(&pool).await?;
-    // Optional: wipe all tables on startup for development convenience.
-    // Usage: RESET_DB=1 cargo run -p der_headend
-    if env_truthy("RESET_DB") {
-        tracing::warn!("RESET_DB is set; truncating database tables");
-        reset_db(&pool).await?;
-    }
-    Ok(Some(pool))
-}
-
-async fn init_db(pool: &PgPool) -> Result<()> {
-    // Create simple tables if they do not exist.
-    // Note: run statements separately to avoid the "cannot insert multiple commands"
-    // error some Postgres drivers produce when using prepared statements.
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS assets (
-            id uuid PRIMARY KEY,
-            site_id uuid NOT NULL,
-            name text NOT NULL,
-            site_name text NOT NULL,
-            location text NOT NULL,
-            capacity_mwhr double precision NOT NULL,
-            max_mw double precision NOT NULL,
-            min_mw double precision NOT NULL,
-            efficiency double precision NOT NULL,
-            ramp_rate_mw_per_min double precision NOT NULL
-        );
-    "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating assets table")?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS telemetry (
-            asset_id uuid NOT NULL,
-            site_id uuid NOT NULL,
-            ts timestamptz NOT NULL,
-            soc_mwhr double precision NOT NULL,
-            soc_pct double precision NOT NULL,
-            capacity_mwhr double precision NOT NULL,
-            current_mw double precision NOT NULL,
-            setpoint_mw double precision NOT NULL,
-            max_mw double precision NOT NULL,
-            min_mw double precision NOT NULL,
-            status text NOT NULL,
-            voltage_v double precision NOT NULL DEFAULT 0,
-            current_a double precision NOT NULL DEFAULT 0,
-            dc_bus_v double precision NOT NULL DEFAULT 0,
-            dc_bus_a double precision NOT NULL DEFAULT 0,
-            temperature_cell_f double precision NOT NULL DEFAULT 0,
-            temperature_module_f double precision NOT NULL DEFAULT 0,
-            temperature_ambient_f double precision NOT NULL DEFAULT 0,
-            soh_pct double precision NOT NULL DEFAULT 0,
-            cycle_count bigint NOT NULL DEFAULT 0,
-            energy_in_mwh double precision NOT NULL DEFAULT 0,
-            energy_out_mwh double precision NOT NULL DEFAULT 0,
-            available_charge_kw double precision NOT NULL DEFAULT 0,
-            available_discharge_kw double precision NOT NULL DEFAULT 0
-        );
-    "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating telemetry table")?;
-
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS voltage_v double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.voltage_v")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS current_a double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.current_a")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS dc_bus_v double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.dc_bus_v")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS dc_bus_a double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.dc_bus_a")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_cell_f double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.temperature_cell_f")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_module_f double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.temperature_module_f")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS temperature_ambient_f double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.temperature_ambient_f")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS soh_pct double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.soh_pct")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cycle_count bigint NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.cycle_count")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS energy_in_mwh double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.energy_in_mwh")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS energy_out_mwh double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.energy_out_mwh")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_charge_kw double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.available_charge_kw")?;
-    sqlx::query(r#"ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_discharge_kw double precision NOT NULL DEFAULT 0;"#)
-        .execute(pool)
-        .await
-        .context("altering telemetry.available_discharge_kw")?;
-
-    try_setup_timescale(pool).await;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            asset_id uuid NOT NULL,
-            peer text NOT NULL,
-            asset_name text,
-            site_name text,
-            connected_at timestamptz NOT NULL,
-            disconnected_at timestamptz
-        );
-    "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating agent_sessions table")?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS dispatches (
-            id uuid PRIMARY KEY,
-            asset_id uuid NOT NULL,
-            mw double precision NOT NULL,
-            duration_s bigint,
-            status text NOT NULL,
-            reason text,
-            submitted_at timestamptz NOT NULL,
-            clamped boolean NOT NULL DEFAULT false
-        );
-    "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating dispatches table")?;
-
-    // Best-effort add missing columns if the table already existed.
-    // Add missing columns individually to avoid multi-statement prepared issues.
-    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS asset_name text;"#)
-        .execute(pool)
-        .await
-        .context("altering agent_sessions.asset_name")?;
-    sqlx::query(r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS site_name text;"#)
-        .execute(pool)
-        .await
-        .context("altering agent_sessions.site_name")?;
-    sqlx::query(
-        r#"ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS disconnected_at timestamptz;"#,
-    )
-    .execute(pool)
-    .await
-    .context("altering agent_sessions.disconnected_at")?;
-    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS clamped boolean NOT NULL DEFAULT false;"#)
-        .execute(pool)
-        .await
-        .context("altering dispatches.clamped")?;
-    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS ack_status text;"#)
-        .execute(pool)
-        .await
-        .context("altering dispatches.ack_status")?;
-    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS acked_at timestamptz;"#)
-        .execute(pool)
-        .await
-        .context("altering dispatches.acked_at")?;
-    sqlx::query(r#"ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS ack_reason text;"#)
-        .execute(pool)
-        .await
-        .context("altering dispatches.ack_reason")?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS heartbeats (
-            asset_id uuid NOT NULL,
-            ts timestamptz NOT NULL
-        );
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating heartbeats table")?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS events (
-            id uuid PRIMARY KEY,
-            asset_id uuid NOT NULL,
-            site_id uuid NOT NULL,
-            ts timestamptz NOT NULL,
-            event_type text NOT NULL,
-            severity text NOT NULL,
-            message text NOT NULL
-        );
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("creating events table")?;
-    Ok(())
-}
-
-async fn try_setup_timescale(pool: &PgPool) {
-    if let Err(err) = sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS timescaledb;"#)
-        .execute(pool)
-        .await
-    {
-        tracing::warn!("timescaledb extension unavailable: {err}");
-        return;
-    }
-
-    if let Err(err) = sqlx::query(
-        r#"
-        SELECT create_hypertable('telemetry', 'ts', if_not_exists => TRUE);
-        "#,
-    )
-    .execute(pool)
-    .await
-    {
-        tracing::warn!("failed to convert telemetry to hypertable: {err}");
-        return;
-    }
-
-    if let Err(err) = sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS telemetry_asset_ts_idx
-        ON telemetry (asset_id, ts DESC);
-        "#,
-    )
-    .execute(pool)
-    .await
-    {
-        tracing::warn!("failed to create telemetry index: {err}");
-    }
-}
-
-async fn persist_telemetry(pool: &PgPool, snaps: &[Telemetry]) -> Result<()> {
-    // Write each snapshot into the telemetry table.
-    for snap in snaps {
-        sqlx::query(
-            r#"
-            INSERT INTO telemetry (
-                asset_id, site_id, ts, soc_mwhr, soc_pct,
-                capacity_mwhr, current_mw, setpoint_mw, max_mw, min_mw, status,
-                voltage_v, current_a, dc_bus_v, dc_bus_a,
-                temperature_cell_f, temperature_module_f, temperature_ambient_f,
-                soh_pct, cycle_count, energy_in_mwh, energy_out_mwh,
-                available_charge_kw, available_discharge_kw
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-        "#,
-        )
-        .bind(snap.asset_id)
-        .bind(snap.site_id)
-        .bind(snap.timestamp)
-        .bind(snap.soc_mwhr)
-        .bind(snap.soc_pct)
-        .bind(snap.capacity_mwhr)
-        .bind(snap.current_mw)
-        .bind(snap.setpoint_mw)
-        .bind(snap.max_mw)
-        .bind(snap.min_mw)
-        .bind(&snap.status)
-        .bind(snap.voltage_v)
-        .bind(snap.current_a)
-        .bind(snap.dc_bus_v)
-        .bind(snap.dc_bus_a)
-        .bind(snap.temperature_cell_f)
-        .bind(snap.temperature_module_f)
-        .bind(snap.temperature_ambient_f)
-        .bind(snap.soh_pct)
-        .bind(snap.cycle_count as i64)
-        .bind(snap.energy_in_mwh)
-        .bind(snap.energy_out_mwh)
-        .bind(snap.available_charge_kw)
-        .bind(snap.available_discharge_kw)
-        .execute(pool)
-        .await
-        .context("inserting telemetry row")?;
-    }
-    Ok(())
-}
-
-async fn persist_assets(pool: &PgPool, assets: &[Asset]) -> Result<()> {
-    // Upsert asset metadata so history queries can join for names.
-    for asset in assets {
-        sqlx::query(
-            r#"
-            INSERT INTO assets (
-                id, site_id, name, site_name, location, capacity_mwhr,
-                max_mw, min_mw, efficiency, ramp_rate_mw_per_min
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            ON CONFLICT (id) DO UPDATE SET
-                site_id = EXCLUDED.site_id,
-                name = EXCLUDED.name,
-                site_name = EXCLUDED.site_name,
-                location = EXCLUDED.location,
-                capacity_mwhr = EXCLUDED.capacity_mwhr,
-                max_mw = EXCLUDED.max_mw,
-                min_mw = EXCLUDED.min_mw,
-                efficiency = EXCLUDED.efficiency,
-                ramp_rate_mw_per_min = EXCLUDED.ramp_rate_mw_per_min
-        "#,
-        )
-        .bind(asset.id)
-        .bind(asset.site_id)
-        .bind(&asset.name)
-        .bind(&asset.site_name)
-        .bind(&asset.location)
-        .bind(asset.capacity_mwhr)
-        .bind(asset.max_mw)
-        .bind(asset.min_mw)
-        .bind(asset.efficiency)
-        .bind(asset.ramp_rate_mw_per_min)
-        .execute(pool)
-        .await
-        .context("upserting asset")?;
-    }
-    Ok(())
-}
-
-async fn persist_dispatch(pool: &PgPool, d: &Dispatch) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO dispatches (id, asset_id, mw, duration_s, status, reason, submitted_at, clamped, ack_status, acked_at, ack_reason)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL)
-        "#,
-    )
-    .bind(d.id)
-    .bind(d.asset_id)
-    .bind(d.mw)
-    .bind(d.duration_s.map(|v| v as i64))
-    .bind(&d.status)
-    .bind(&d.reason)
-    .bind(d.submitted_at)
-    .bind(d.clamped)
-    .execute(pool)
-    .await
-    .context("inserting dispatch row")?;
-    Ok(())
-}
-
-async fn persist_event(pool: &PgPool, event: &BessEvent) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO events (id, asset_id, site_id, ts, event_type, severity, message)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(event.id)
-    .bind(event.asset_id)
-    .bind(event.site_id)
-    .bind(event.timestamp)
-    .bind(&event.event_type)
-    .bind(&event.severity)
-    .bind(&event.message)
-    .execute(pool)
-    .await
-    .context("inserting event")?;
-    Ok(())
-}
-
-async fn persist_heartbeat(pool: &PgPool, asset_id: Uuid, ts: DateTime<Utc>) -> Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO heartbeats (asset_id, ts)
-        VALUES ($1, $2)
-        "#,
-    )
-    .bind(asset_id)
-    .bind(ts)
-    .execute(pool)
-    .await
-    .context("inserting heartbeat")?;
     Ok(())
 }
 
@@ -2435,151 +1970,6 @@ async fn get_asset(State(state): State<AppState>, Path(id): Path<Uuid>) -> Respo
     }
 }
 
-#[derive(Serialize)]
-struct SiteView {
-    site_id: Uuid,
-    site_name: String,
-    location: String,
-    aggregate: SiteAggregate,
-    assets: Vec<AssetView>,
-}
-
-#[derive(Serialize)]
-struct SiteAggregate {
-    asset_count: usize,
-    capacity_mwhr: f64,
-    max_mw: f64,
-    min_mw: f64,
-    min_soc_pct: f64,
-    max_soc_pct: f64,
-    efficiency: f64,
-    ramp_rate_mw_per_min: f64,
-    soc_mwhr: Option<f64>,
-    soc_pct: Option<f64>,
-    current_mw: Option<f64>,
-    setpoint_mw: Option<f64>,
-}
-
-#[derive(Default)]
-struct SiteAggregateBuilder {
-    asset_count: usize,
-    capacity_sum: f64,
-    max_mw_sum: f64,
-    min_mw_sum: f64,
-    weight_sum: f64,
-    min_soc_weighted: f64,
-    max_soc_weighted: f64,
-    efficiency_weighted: f64,
-    ramp_weighted: f64,
-    min_soc_sum: f64,
-    max_soc_sum: f64,
-    efficiency_sum: f64,
-    ramp_sum: f64,
-    soc_mwhr_sum: f64,
-    soc_cap_sum: f64,
-    has_soc: bool,
-    current_mw_sum: f64,
-    current_count: usize,
-    setpoint_mw_sum: f64,
-    setpoint_count: usize,
-}
-
-impl SiteAggregateBuilder {
-    fn add_asset(&mut self, asset: &AssetView) {
-        let cap = asset.capacity_mwhr.max(0.0);
-        self.asset_count += 1;
-        self.capacity_sum += cap;
-        self.max_mw_sum += asset.max_mw;
-        self.min_mw_sum += asset.min_mw;
-
-        self.min_soc_sum += asset.min_soc_pct;
-        self.max_soc_sum += asset.max_soc_pct;
-        self.efficiency_sum += asset.efficiency;
-        self.ramp_sum += asset.ramp_rate_mw_per_min;
-
-        if cap > 0.0 {
-            self.weight_sum += cap;
-            self.min_soc_weighted += asset.min_soc_pct * cap;
-            self.max_soc_weighted += asset.max_soc_pct * cap;
-            self.efficiency_weighted += asset.efficiency * cap;
-            self.ramp_weighted += asset.ramp_rate_mw_per_min * cap;
-        }
-
-        if let Some(soc_mwhr) = asset.soc_mwhr {
-            self.soc_mwhr_sum += soc_mwhr;
-            self.soc_cap_sum += cap;
-            self.has_soc = true;
-        }
-        if let Some(current_mw) = asset.current_mw {
-            self.current_mw_sum += current_mw;
-            self.current_count += 1;
-        }
-        if let Some(setpoint_mw) = asset.setpoint_mw {
-            self.setpoint_mw_sum += setpoint_mw;
-            self.setpoint_count += 1;
-        }
-    }
-
-    fn finish(self) -> SiteAggregate {
-        let avg_or_weighted = |weighted_sum: f64, plain_sum: f64, weight: f64, count: usize| {
-            if weight > 0.0 {
-                weighted_sum / weight
-            } else if count > 0 {
-                plain_sum / count as f64
-            } else {
-                0.0
-            }
-        };
-
-        SiteAggregate {
-            asset_count: self.asset_count,
-            capacity_mwhr: self.capacity_sum,
-            max_mw: self.max_mw_sum,
-            min_mw: self.min_mw_sum,
-            min_soc_pct: avg_or_weighted(
-                self.min_soc_weighted,
-                self.min_soc_sum,
-                self.weight_sum,
-                self.asset_count,
-            ),
-            max_soc_pct: avg_or_weighted(
-                self.max_soc_weighted,
-                self.max_soc_sum,
-                self.weight_sum,
-                self.asset_count,
-            ),
-            efficiency: avg_or_weighted(
-                self.efficiency_weighted,
-                self.efficiency_sum,
-                self.weight_sum,
-                self.asset_count,
-            ),
-            ramp_rate_mw_per_min: avg_or_weighted(
-                self.ramp_weighted,
-                self.ramp_sum,
-                self.weight_sum,
-                self.asset_count,
-            ),
-            soc_mwhr: self.has_soc.then_some(self.soc_mwhr_sum),
-            soc_pct: if self.has_soc && self.soc_cap_sum > 0.0 {
-                Some(self.soc_mwhr_sum / self.soc_cap_sum * 100.0)
-            } else {
-                None
-            },
-            current_mw: (self.current_count > 0).then_some(self.current_mw_sum),
-            setpoint_mw: (self.setpoint_count > 0).then_some(self.setpoint_mw_sum),
-        }
-    }
-}
-
-struct SiteAccumulator {
-    site_id: Uuid,
-    site_name: String,
-    location: String,
-    assets: Vec<AssetView>,
-    aggregate: SiteAggregateBuilder,
-}
-
 async fn list_sites(State(state): State<AppState>) -> Json<Vec<SiteView>> {
     let assets = build_asset_views(&state).await;
     let mut sites: HashMap<Uuid, SiteAccumulator> = HashMap::new();
@@ -2674,129 +2064,6 @@ async fn latest_telemetry(State(state): State<AppState>, Path(id): Path<Uuid>) -
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
-}
-
-#[derive(Serialize, sqlx::FromRow)]
-struct TelemetryRow {
-    ts: DateTime<Utc>,
-    asset_name: String,
-    site_name: String,
-    soc_mwhr: f64,
-    soc_pct: f64,
-    capacity_mwhr: f64,
-    current_mw: f64,
-    setpoint_mw: f64,
-    max_mw: f64,
-    min_mw: f64,
-    status: String,
-    voltage_v: f64,
-    current_a: f64,
-    dc_bus_v: f64,
-    dc_bus_a: f64,
-    temperature_cell_f: f64,
-    temperature_module_f: f64,
-    temperature_ambient_f: f64,
-    soh_pct: f64,
-    cycle_count: i64,
-    energy_in_mwh: f64,
-    energy_out_mwh: f64,
-    available_charge_kw: f64,
-    available_discharge_kw: f64,
-    asset_id: Uuid,
-    site_id: Uuid,
-}
-
-#[derive(sqlx::FromRow)]
-struct TelemetrySnapshotRow {
-    asset_id: Uuid,
-    site_id: Uuid,
-    site_name: String,
-    ts: DateTime<Utc>,
-    soc_mwhr: f64,
-    soc_pct: f64,
-    capacity_mwhr: f64,
-    current_mw: f64,
-    setpoint_mw: f64,
-    max_mw: f64,
-    min_mw: f64,
-    status: String,
-    voltage_v: f64,
-    current_a: f64,
-    dc_bus_v: f64,
-    dc_bus_a: f64,
-    temperature_cell_f: f64,
-    temperature_module_f: f64,
-    temperature_ambient_f: f64,
-    soh_pct: f64,
-    cycle_count: i64,
-    energy_in_mwh: f64,
-    energy_out_mwh: f64,
-    available_charge_kw: f64,
-    available_discharge_kw: f64,
-}
-
-#[derive(sqlx::FromRow)]
-struct DispatchSnapshotRow {
-    id: Uuid,
-    asset_id: Uuid,
-    mw: f64,
-    duration_s: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TimeRange {
-    start: Option<String>,
-    end: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct IncomingDispatch {
-    asset_id: Option<String>,
-    site_id: Option<String>,
-    mw: f64,
-    duration_s: Option<u64>,
-}
-
-#[derive(Serialize, sqlx::FromRow)]
-struct HeartbeatRow {
-    asset_id: Uuid,
-    ts: DateTime<Utc>,
-    asset_name: String,
-    site_name: String,
-}
-
-#[derive(Serialize)]
-struct AssetView {
-    available_charge_kw: Option<f64>,
-    available_discharge_kw: Option<f64>,
-    capacity_mwhr: f64,
-    current_a: Option<f64>,
-    current_mw: Option<f64>,
-    cycle_count: Option<u64>,
-    dc_bus_a: Option<f64>,
-    dc_bus_v: Option<f64>,
-    efficiency: f64,
-    energy_in_mwh: Option<f64>,
-    energy_out_mwh: Option<f64>,
-    id: Uuid,
-    location: String,
-    max_mw: f64,
-    max_soc_pct: f64,
-    min_mw: f64,
-    min_soc_pct: f64,
-    name: String,
-    ramp_rate_mw_per_min: f64,
-    setpoint_mw: Option<f64>,
-    soh_pct: Option<f64>,
-    soc_mwhr: Option<f64>,
-    soc_pct: Option<f64>,
-    site_id: Uuid,
-    site_name: String,
-    status: Option<String>,
-    temperature_ambient_f: Option<f64>,
-    temperature_cell_f: Option<f64>,
-    temperature_module_f: Option<f64>,
-    voltage_v: Option<f64>,
 }
 
 async fn history_telemetry(
@@ -3270,58 +2537,6 @@ async fn push_setpoint_to_agent(state: &AppState, dispatch: &Dispatch) -> Result
         })
         .await
         .context("sending setpoint over gRPC")?;
-    Ok(())
-}
-
-async fn record_agent_connect(
-    db: &PgPool,
-    asset_id: Uuid,
-    peer: &str,
-    asset_name: &str,
-    site_name: &str,
-) -> Result<()> {
-    // Defensive: if we see a duplicate Register (or a reconnect without a clean disconnect),
-    // ensure we don't accumulate multiple "open" sessions for the same asset.
-    sqlx::query(
-        r#"
-        UPDATE agent_sessions
-        SET disconnected_at = now()
-        WHERE asset_id = $1 AND disconnected_at IS NULL
-        "#,
-    )
-    .bind(asset_id)
-    .execute(db)
-    .await
-    .context("closing prior open agent session (if any)")?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO agent_sessions (asset_id, peer, asset_name, site_name, connected_at)
-        VALUES ($1, $2, $3, $4, now())
-        "#,
-    )
-    .bind(asset_id)
-    .bind(peer)
-    .bind(asset_name)
-    .bind(site_name)
-    .execute(db)
-    .await
-    .context("inserting agent session start")?;
-    Ok(())
-}
-
-async fn record_agent_disconnect(db: &PgPool, asset_id: Uuid) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE agent_sessions
-        SET disconnected_at = now()
-        WHERE asset_id = $1 AND disconnected_at IS NULL
-        "#,
-    )
-    .bind(asset_id)
-    .execute(db)
-    .await
-    .context("updating agent session end")?;
     Ok(())
 }
 
