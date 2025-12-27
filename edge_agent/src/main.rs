@@ -7,30 +7,46 @@
 //! - Push telemetry upstream; receive setpoints on the same stream.
 //! - Configuration comes from env vars: ASSET_ID, SITE_ID, HEADEND_GRPC, plus asset params (and optional gateway mode vars).
 
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use futures_util::StreamExt;
 use opcua::client::prelude::{
     AttributeService,
     AttributeId, ClientBuilder, DataValue, EndpointDescription, IdentityToken, MessageSecurityMode,
-    NodeId, SecurityPolicy, UAString, UserTokenPolicy, Variant, WriteValue,
+    NodeId, QualifiedName, ReadValueId, SecurityPolicy, Session, TimestampsToReturn, UAString,
+    UserTokenPolicy, Variant, WriteValue,
 };
+use opcua::types::StatusCode;
 use serde::{Deserialize, Serialize};
 use sim_core::{Asset, BessEvent, BessState, Telemetry, tick_asset};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use prost::Message;
 
 pub mod proto {
     tonic::include_proto!("agent");
 }
 use proto::{
-    AgentToHeadend, AssetDescriptor, DispatchAck, Event as ProtoEvent, Heartbeat, Register,
-    Setpoint, agent_link_client::AgentLinkClient, agent_to_headend, headend_to_agent,
+    AgentToHeadend, AssetDescriptor, BootstrapRequest, BootstrapResponse, DispatchAck,
+    Event as ProtoEvent, Heartbeat, Register, Setpoint, agent_link_client::AgentLinkClient,
+    agent_to_headend, headend_to_agent,
 };
+use tonic::codec::CompressionEncoding;
+use tonic::transport::Channel;
 
 #[derive(Clone)]
 struct AppState {
@@ -39,6 +55,44 @@ struct AppState {
     headend_grpc: String,
     gateway_id: String,
     opcua: Option<Arc<OpcUaClient>>,
+    grpc_stats: Arc<GrpcStats>,
+}
+
+struct GrpcStats {
+    sent_bytes: AtomicU64,
+    sent_messages: AtomicU64,
+    sent_gzip_bytes: AtomicU64,
+    sent_gzip_raw_bytes: AtomicU64,
+}
+
+impl GrpcStats {
+    fn new() -> Self {
+        Self {
+            sent_bytes: AtomicU64::new(0),
+            sent_messages: AtomicU64::new(0),
+            sent_gzip_bytes: AtomicU64::new(0),
+            sent_gzip_raw_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn record_telemetry(&self, msg: &proto::Telemetry) {
+        let raw_len = msg.encoded_len() as u64;
+        self.sent_bytes.fetch_add(raw_len, Ordering::Relaxed);
+        self.sent_messages.fetch_add(1, Ordering::Relaxed);
+
+        let raw = msg.encode_to_vec();
+        if let Ok(gz_len) = estimate_gzip_len(&raw) {
+            self.sent_gzip_bytes.fetch_add(gz_len as u64, Ordering::Relaxed);
+            self.sent_gzip_raw_bytes.fetch_add(raw_len, Ordering::Relaxed);
+        }
+    }
+}
+
+fn estimate_gzip_len(data: &[u8]) -> std::io::Result<usize> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data)?;
+    let out = encoder.finish()?;
+    Ok(out.len())
 }
 
 #[derive(Clone)]
@@ -64,22 +118,65 @@ async fn main() -> Result<()> {
     let cfg = AgentConfig::from_env()?;
     let (primary_asset_id, assets_map) = build_assets_map(&cfg);
     let opcua = cfg.opcua.clone().map(OpcUaClient::new).map(Arc::new);
+    let grpc_stats = Arc::new(GrpcStats::new());
     let state = AppState {
         headend_grpc: cfg.headend_grpc.clone(),
         assets: Arc::new(RwLock::new(assets_map)),
         gateway_id: cfg.gateway_id.clone(),
         opcua,
+        grpc_stats: grpc_stats.clone(),
     };
+
+    spawn_grpc_stats_logger(grpc_stats);
 
     // Start the tick + gRPC stream in the background.
     run_grpc_loop(state.clone(), primary_asset_id).await?;
     Ok(())
 }
 
+fn spawn_grpc_stats_logger(stats: Arc<GrpcStats>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let bytes = stats.sent_bytes.swap(0, Ordering::Relaxed);
+            let msgs = stats.sent_messages.swap(0, Ordering::Relaxed);
+            let gz_bytes = stats.sent_gzip_bytes.swap(0, Ordering::Relaxed);
+            let raw_bytes = stats.sent_gzip_raw_bytes.swap(0, Ordering::Relaxed);
+            if msgs == 0 {
+                continue;
+            }
+            let kbps = (bytes as f64) / 1024.0 / 60.0;
+            let compression = if raw_bytes > 0 {
+                100.0 * (1.0 - (gz_bytes as f64 / raw_bytes as f64))
+            } else {
+                0.0
+            };
+            tracing::info!(
+                "grpc telemetry tx msgs={} bytes={} kbps={:.2} gzip_savings={:.1}%",
+                msgs,
+                bytes,
+                kbps,
+                compression
+            );
+        }
+    });
+}
+
 async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
     loop {
-        match AgentLinkClient::connect(state.headend_grpc.clone()).await {
-            Ok(mut client) => {
+        match Channel::from_shared(state.headend_grpc.clone())
+            .with_context(|| format!("invalid HEADEND_GRPC {}", state.headend_grpc))?
+            .connect()
+            .await
+        {
+            Ok(channel) => {
+                let mut client = AgentLinkClient::new(channel)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip);
+                if let Err(err) = bootstrap_from_headend(&state, &mut client).await {
+                    tracing::warn!("bootstrap failed: {err}");
+                }
                 // Channel to send outbound messages to headend.
                 let (tx, rx) = tokio::sync::mpsc::channel::<AgentToHeadend>(32);
                 let outbound = ReceiverStream::new(rx);
@@ -146,26 +243,65 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
                             let assets_snapshot = snapshot_assets(&state).await;
                             let mut stream_alive = true;
                             for (_asset_id, asset, sim) in assets_snapshot {
-                                let snap = {
-                                    let mut sim_guard = sim.write().await;
-                                    tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
-                                };
-                                let events = maybe_generate_events(&state, &asset, &snap).await;
-        if let Some(opc) = state.opcua.clone() {
-            if let Err(err) = opc.write_telemetry(&snap).await {
-                                        tracing::warn!(
-                                            "opc ua telemetry write failed: asset={} site={} err={:?}",
-                                            asset.name,
-                                            asset.site_name,
-                                            err
-                                        );
+                                let opcua = state.opcua.clone();
+                                let mut snap_opt = None;
+                                let mut used_opcua = false;
+
+                                if let Some(opc) = opcua.clone() {
+                                    if !opc.telemetry_write_sim_enabled()
+                                        && opc.telemetry_enabled_for_asset(asset.id)
+                                    {
+                                        match opc.read_telemetry(asset.id).await {
+                                            Ok(Some(sample)) => {
+                                                let sim_state = sim.read().await.clone();
+                                                snap_opt = Some(telemetry_from_opcua(
+                                                    &asset,
+                                                    &sim_state,
+                                                    sample,
+                                                ));
+                                                used_opcua = true;
+                                            }
+                                            Ok(None) => {}
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "opc ua telemetry read failed: asset={} site={} err={:?}",
+                                                    asset.name,
+                                                    asset.site_name,
+                                                    err
+                                                );
+                                            }
+                                        }
                                     }
                                 }
+
+        let snap = if let Some(snap) = snap_opt.take() {
+            snap
+        } else {
+            let mut sim_guard = sim.write().await;
+            tick_asset(&asset, &mut sim_guard, interval.as_secs_f64())
+        };
+        if !used_opcua {
+            if let Some(opc) = opcua.clone() {
+                if let Err(err) = opc.write_sim_telemetry(&snap).await {
+                    tracing::warn!(
+                        "opc ua telemetry write failed: asset={} site={} err={:?}",
+                        asset.name,
+                        asset.site_name,
+                        err
+                    );
+                }
+            }
+        }
+        let events = if used_opcua {
+            Vec::new()
+        } else {
+            maybe_generate_events(&state, &asset, &snap).await
+                                };
+                                let proto_snap = to_proto_telemetry(&snap);
+                                state.grpc_stats.record_telemetry(&proto_snap);
                                 if tx
                                     .send(AgentToHeadend {
-                                        msg: Some(agent_to_headend::Msg::Telemetry(
-                                            to_proto_telemetry(&snap),
-                                        )),
+                                        msg: Some(agent_to_headend::Msg::Telemetry(proto_snap)),
                                     })
                                     .await
                                     .is_err()
@@ -212,6 +348,78 @@ async fn run_grpc_loop(state: AppState, primary_asset: Uuid) -> Result<()> {
     }
 }
 
+async fn bootstrap_from_headend(
+    state: &AppState,
+    client: &mut AgentLinkClient<Channel>,
+) -> Result<()> {
+    let asset_ids: Vec<String> = {
+        let assets = state.assets.read().await;
+        let mut ids: Vec<String> = assets.keys().map(|id| id.to_string()).collect();
+        ids.sort();
+        ids
+    };
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let resp = client
+        .bootstrap(BootstrapRequest { asset_ids })
+        .await
+        .map_err(|e| anyhow!("bootstrap rpc failed: {e:?}"))?;
+    apply_bootstrap(state, resp.into_inner()).await?;
+    Ok(())
+}
+
+async fn apply_bootstrap(state: &AppState, resp: BootstrapResponse) -> Result<()> {
+    for entry in resp.assets {
+        let asset_id = match Uuid::parse_str(&entry.asset_id) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!("bootstrap asset_id parse failed asset_id={} err={err}", entry.asset_id);
+                continue;
+            }
+        };
+        let runtime = {
+            let assets = state.assets.read().await;
+            assets.get(&asset_id).cloned()
+        };
+        let Some(rt) = runtime else {
+            tracing::warn!("bootstrap asset not found asset_id={}", asset_id);
+            continue;
+        };
+        let mut desired_setpoint = None;
+        if let Some(sp) = entry.setpoint.as_ref() {
+            desired_setpoint = Some(sp.mw);
+        } else if let Some(t) = entry.telemetry.as_ref() {
+            desired_setpoint = Some(t.setpoint_mw);
+        }
+        if let Some(t) = entry.telemetry {
+            let mut sim = rt.sim.write().await;
+            sim.soc_mwhr = t.soc_mwhr;
+            sim.current_mw = t.current_mw;
+            if let Some(mw) = desired_setpoint {
+                sim.setpoint_mw = mw;
+            }
+            drop(sim);
+            let (min_soc, max_soc) = soc_bounds(&rt.asset);
+            let eps = 1e-6;
+            let next = if t.soc_mwhr <= min_soc + eps {
+                SocState::BelowMin
+            } else if t.soc_mwhr >= max_soc - eps {
+                SocState::AboveMax
+            } else {
+                SocState::InRange
+            };
+            let mut soc_state = rt.soc_state.write().await;
+            *soc_state = next;
+        } else if let Some(mw) = desired_setpoint {
+            let mut sim = rt.sim.write().await;
+            sim.setpoint_mw = mw;
+        }
+        tracing::info!("bootstrap applied asset_id={}", asset_id);
+    }
+    Ok(())
+}
+
 fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
     proto::Telemetry {
         asset_id: t.asset_id.to_string(),
@@ -226,6 +434,19 @@ fn to_proto_telemetry(t: &Telemetry) -> proto::Telemetry {
         max_mw: t.max_mw,
         min_mw: t.min_mw,
         status: t.status.clone(),
+        voltage_v: t.voltage_v,
+        current_a: t.current_a,
+        dc_bus_v: t.dc_bus_v,
+        dc_bus_a: t.dc_bus_a,
+        temperature_cell_f: t.temperature_cell_f,
+        temperature_module_f: t.temperature_module_f,
+        temperature_ambient_f: t.temperature_ambient_f,
+        soh_pct: t.soh_pct,
+        cycle_count: t.cycle_count,
+        energy_in_mwh: t.energy_in_mwh,
+        energy_out_mwh: t.energy_out_mwh,
+        available_charge_kw: t.available_charge_kw,
+        available_discharge_kw: t.available_discharge_kw,
     }
 }
 
@@ -238,6 +459,59 @@ fn to_proto_event(e: &BessEvent) -> ProtoEvent {
         event_type: e.event_type.clone(),
         severity: e.severity.clone(),
         message: e.message.clone(),
+    }
+}
+
+fn telemetry_from_opcua(asset: &Asset, sim: &BessState, sample: OpcUaTelemetrySample) -> Telemetry {
+    let soc_mwhr = sample.soc_mwhr.unwrap_or(sim.soc_mwhr);
+    let soc_pct = sample.soc_pct.unwrap_or_else(|| {
+        if asset.capacity_mwhr.abs() < f64::EPSILON {
+            0.0
+        } else {
+            (soc_mwhr / asset.capacity_mwhr) * 100.0
+        }
+    });
+    let current_mw = sample.current_mw.unwrap_or(sim.current_mw);
+    let status = sample.status.unwrap_or_else(|| {
+        if current_mw > 0.1 {
+            "discharging".to_string()
+        } else if current_mw < -0.1 {
+            "charging".to_string()
+        } else {
+            "idle".to_string()
+        }
+    });
+    let available_charge_kw = (-asset.min_mw).max(0.0) * 1000.0;
+    let available_discharge_kw = asset.max_mw.max(0.0) * 1000.0;
+
+    Telemetry {
+        asset_id: asset.id,
+        site_id: asset.site_id,
+        site_name: asset.site_name.clone(),
+        timestamp: Utc::now(),
+        soc_mwhr,
+        soc_pct,
+        capacity_mwhr: asset.capacity_mwhr,
+        current_mw,
+        setpoint_mw: sim.setpoint_mw,
+        max_mw: asset.max_mw,
+        min_mw: asset.min_mw,
+        status,
+        voltage_v: sample.voltage_v.unwrap_or(0.0),
+        current_a: sample.current_a.unwrap_or(0.0),
+        dc_bus_v: sample.dc_bus_v.unwrap_or(0.0),
+        dc_bus_a: sample.dc_bus_a.unwrap_or(0.0),
+        temperature_cell_f: sample.temperature_cell_f.unwrap_or(0.0),
+        temperature_module_f: sample.temperature_module_f.unwrap_or(0.0),
+        temperature_ambient_f: sample.temperature_ambient_f.unwrap_or(0.0),
+        soh_pct: sample.soh_pct.unwrap_or(100.0),
+        cycle_count: sample.cycle_count.unwrap_or(0),
+        energy_in_mwh: sample.energy_in_mwh.unwrap_or(0.0),
+        energy_out_mwh: sample.energy_out_mwh.unwrap_or(0.0),
+        available_charge_kw: sample.available_charge_kw.unwrap_or(available_charge_kw),
+        available_discharge_kw: sample
+            .available_discharge_kw
+            .unwrap_or(available_discharge_kw),
     }
 }
 
@@ -719,10 +993,13 @@ struct OpcUaConfig {
     password: Option<String>,
     // Per-asset mapping; if missing, falls back to default_* nodes.
     setpoints: std::collections::HashMap<Uuid, NodeId>,
-    telemetry_nodes: TelemetryNodes,
+    telemetry_defaults: TelemetryNodes,
+    telemetry_assets: std::collections::HashMap<Uuid, TelemetryNodes>,
     // Defaults used when an asset-specific mapping is absent.
     default_setpoint: Option<NodeId>,
     default_telemetry: TelemetryNodes,
+    telemetry_interval: Duration,
+    telemetry_write_sim: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -731,6 +1008,19 @@ struct TelemetryNodes {
     soc_pct: Option<NodeId>,
     soc_mwhr: Option<NodeId>,
     status: Option<NodeId>,
+    voltage_v: Option<NodeId>,
+    current_a: Option<NodeId>,
+    dc_bus_v: Option<NodeId>,
+    dc_bus_a: Option<NodeId>,
+    temperature_cell_f: Option<NodeId>,
+    temperature_module_f: Option<NodeId>,
+    temperature_ambient_f: Option<NodeId>,
+    soh_pct: Option<NodeId>,
+    cycle_count: Option<NodeId>,
+    energy_in_mwh: Option<NodeId>,
+    energy_out_mwh: Option<NodeId>,
+    available_charge_kw: Option<NodeId>,
+    available_discharge_kw: Option<NodeId>,
 }
 
 impl TelemetryNodes {
@@ -743,6 +1033,40 @@ impl TelemetryNodes {
                 .clone()
                 .or_else(|| defaults.soc_mwhr.clone()),
             status: self.status.clone().or_else(|| defaults.status.clone()),
+            voltage_v: self.voltage_v.clone().or_else(|| defaults.voltage_v.clone()),
+            current_a: self.current_a.clone().or_else(|| defaults.current_a.clone()),
+            dc_bus_v: self.dc_bus_v.clone().or_else(|| defaults.dc_bus_v.clone()),
+            dc_bus_a: self.dc_bus_a.clone().or_else(|| defaults.dc_bus_a.clone()),
+            temperature_cell_f: self
+                .temperature_cell_f
+                .clone()
+                .or_else(|| defaults.temperature_cell_f.clone()),
+            temperature_module_f: self
+                .temperature_module_f
+                .clone()
+                .or_else(|| defaults.temperature_module_f.clone()),
+            temperature_ambient_f: self
+                .temperature_ambient_f
+                .clone()
+                .or_else(|| defaults.temperature_ambient_f.clone()),
+            soh_pct: self.soh_pct.clone().or_else(|| defaults.soh_pct.clone()),
+            cycle_count: self.cycle_count.clone().or_else(|| defaults.cycle_count.clone()),
+            energy_in_mwh: self
+                .energy_in_mwh
+                .clone()
+                .or_else(|| defaults.energy_in_mwh.clone()),
+            energy_out_mwh: self
+                .energy_out_mwh
+                .clone()
+                .or_else(|| defaults.energy_out_mwh.clone()),
+            available_charge_kw: self
+                .available_charge_kw
+                .clone()
+                .or_else(|| defaults.available_charge_kw.clone()),
+            available_discharge_kw: self
+                .available_discharge_kw
+                .clone()
+                .or_else(|| defaults.available_discharge_kw.clone()),
         }
     }
 }
@@ -762,6 +1086,12 @@ struct OpcUaConfigFile {
     telemetry: Option<OpcUaTelemetryMap>,
     #[serde(default)]
     default_telemetry: Option<OpcUaTelemetryMap>,
+    #[serde(default)]
+    telemetry_assets: std::collections::HashMap<String, OpcUaTelemetryMap>,
+    #[serde(default)]
+    telemetry_interval_s: Option<u64>,
+    #[serde(default)]
+    telemetry_write_sim: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -774,6 +1104,32 @@ struct OpcUaTelemetryMap {
     soc_mwhr: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    voltage_v: Option<String>,
+    #[serde(default)]
+    current_a: Option<String>,
+    #[serde(default)]
+    dc_bus_v: Option<String>,
+    #[serde(default)]
+    dc_bus_a: Option<String>,
+    #[serde(default)]
+    temperature_cell_f: Option<String>,
+    #[serde(default)]
+    temperature_module_f: Option<String>,
+    #[serde(default)]
+    temperature_ambient_f: Option<String>,
+    #[serde(default)]
+    soh_pct: Option<String>,
+    #[serde(default)]
+    cycle_count: Option<String>,
+    #[serde(default)]
+    energy_in_mwh: Option<String>,
+    #[serde(default)]
+    energy_out_mwh: Option<String>,
+    #[serde(default)]
+    available_charge_kw: Option<String>,
+    #[serde(default)]
+    available_discharge_kw: Option<String>,
 }
 
 impl OpcUaConfig {
@@ -800,7 +1156,7 @@ impl OpcUaConfig {
 
         let username = std::env::var("OPCUA_USERNAME").ok();
         let password = std::env::var("OPCUA_PASSWORD").ok();
-        let default_telemetry = TelemetryNodes {
+        let telemetry_defaults = TelemetryNodes {
             current_mw: std::env::var("OPCUA_NODE_CURRENT_MW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -813,16 +1169,67 @@ impl OpcUaConfig {
             status: std::env::var("OPCUA_NODE_STATUS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            voltage_v: std::env::var("OPCUA_NODE_VOLTAGE_V")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            current_a: std::env::var("OPCUA_NODE_CURRENT_A")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            dc_bus_v: std::env::var("OPCUA_NODE_DC_BUS_V")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            dc_bus_a: std::env::var("OPCUA_NODE_DC_BUS_A")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_cell_f: std::env::var("OPCUA_NODE_TEMPERATURE_CELL_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_module_f: std::env::var("OPCUA_NODE_TEMPERATURE_MODULE_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            temperature_ambient_f: std::env::var("OPCUA_NODE_TEMPERATURE_AMBIENT_F")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            soh_pct: std::env::var("OPCUA_NODE_SOH_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            cycle_count: std::env::var("OPCUA_NODE_CYCLE_COUNT")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            energy_in_mwh: std::env::var("OPCUA_NODE_ENERGY_IN_MWH")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            energy_out_mwh: std::env::var("OPCUA_NODE_ENERGY_OUT_MWH")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            available_charge_kw: std::env::var("OPCUA_NODE_AVAILABLE_CHARGE_KW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            available_discharge_kw: std::env::var("OPCUA_NODE_AVAILABLE_DISCHARGE_KW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         };
+        let telemetry_interval = std::env::var("OPCUA_TELEMETRY_INTERVAL_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_write_sim = std::env::var("OPCUA_TELEMETRY_WRITE_SIM")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(false);
 
         Ok(Some(Self {
             endpoint,
             username,
             password,
             setpoints: std::collections::HashMap::new(),
-            telemetry_nodes: TelemetryNodes::default(),
+            telemetry_defaults,
+            telemetry_assets: std::collections::HashMap::new(),
             default_setpoint,
-            default_telemetry,
+            default_telemetry: TelemetryNodes::default(),
+            telemetry_interval,
+            telemetry_write_sim,
         }))
     }
 
@@ -847,17 +1254,32 @@ impl OpcUaConfig {
             None => None,
         };
 
-        let telemetry_nodes = Self::telemetry_map_to_nodes(&file.telemetry)?;
+        let telemetry_defaults = Self::telemetry_map_to_nodes(&file.telemetry)?;
         let default_telemetry = Self::telemetry_map_to_nodes(&file.default_telemetry)?;
+        let telemetry_interval = file
+            .telemetry_interval_s
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(0));
+        let telemetry_write_sim = file.telemetry_write_sim.unwrap_or(false);
+
+        let mut telemetry_assets = std::collections::HashMap::new();
+        for (k, v) in file.telemetry_assets {
+            let id: Uuid = k.parse().map_err(|e| anyhow!("bad asset id {}: {e:?}", k))?;
+            let nodes = Self::telemetry_map_to_nodes(&Some(v))?;
+            telemetry_assets.insert(id, nodes);
+        }
 
         Ok(Some(Self {
             endpoint,
             username,
             password,
             setpoints,
-            telemetry_nodes,
+            telemetry_defaults,
+            telemetry_assets,
             default_setpoint,
             default_telemetry,
+            telemetry_interval,
+            telemetry_write_sim,
         }))
     }
 
@@ -893,12 +1315,116 @@ impl OpcUaConfig {
             ),
             None => None,
         };
+        let voltage_v = match &map.voltage_v {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry voltage_v node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let current_a = match &map.current_a {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry current_a node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let dc_bus_v = match &map.dc_bus_v {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry dc_bus_v node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let dc_bus_a = match &map.dc_bus_a {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry dc_bus_a node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_cell_f = match &map.temperature_cell_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_cell_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_module_f = match &map.temperature_module_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_module_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let temperature_ambient_f = match &map.temperature_ambient_f {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry temperature_ambient_f node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let soh_pct = match &map.soh_pct {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry soh_pct node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let cycle_count = match &map.cycle_count {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry cycle_count node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let energy_in_mwh = match &map.energy_in_mwh {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry energy_in_mwh node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let energy_out_mwh = match &map.energy_out_mwh {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry energy_out_mwh node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let available_charge_kw = match &map.available_charge_kw {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry available_charge_kw node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
+        let available_discharge_kw = match &map.available_discharge_kw {
+            Some(s) => Some(
+                s.parse()
+                    .map_err(|e| anyhow!("bad telemetry available_discharge_kw node {}: {e:?}", s))?,
+            ),
+            None => None,
+        };
 
         Ok(TelemetryNodes {
             current_mw,
             soc_pct,
             soc_mwhr,
             status,
+            voltage_v,
+            current_a,
+            dc_bus_v,
+            dc_bus_a,
+            temperature_cell_f,
+            temperature_module_f,
+            temperature_ambient_f,
+            soh_pct,
+            cycle_count,
+            energy_in_mwh,
+            energy_out_mwh,
+            available_charge_kw,
+            available_discharge_kw,
         })
     }
 }
@@ -1236,37 +1762,88 @@ impl AgentConfig {
 #[derive(Clone)]
 struct OpcUaClient {
     cfg: OpcUaConfig,
+    last_telemetry: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>,
+    last_sample: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, OpcUaTelemetrySample>>>,
+    session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<opcua::sync::RwLock<Session>>>>>,
 }
 
 impl OpcUaClient {
     fn new(cfg: OpcUaConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            last_telemetry: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            last_sample: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
     fn telemetry_nodes_for_asset(&self, _asset_id: Uuid) -> TelemetryNodes {
-        // Currently uses shared defaults only; placeholder for per-asset telemetry maps if needed.
+        // Per-asset nodes override shared defaults.
+        if let Some(nodes) = self.cfg.telemetry_assets.get(&_asset_id) {
+            return nodes.clone_with_defaults(&self.cfg.telemetry_defaults);
+        }
         self.cfg
-            .telemetry_nodes
+            .telemetry_defaults
             .clone_with_defaults(&self.cfg.default_telemetry)
     }
 
+    fn telemetry_enabled_for_asset(&self, asset_id: Uuid) -> bool {
+        let nodes = self.telemetry_nodes_for_asset(asset_id);
+        nodes.current_mw.is_some()
+            || nodes.soc_pct.is_some()
+            || nodes.soc_mwhr.is_some()
+            || nodes.status.is_some()
+            || nodes.voltage_v.is_some()
+            || nodes.current_a.is_some()
+            || nodes.dc_bus_v.is_some()
+            || nodes.dc_bus_a.is_some()
+            || nodes.temperature_cell_f.is_some()
+            || nodes.temperature_module_f.is_some()
+            || nodes.temperature_ambient_f.is_some()
+            || nodes.soh_pct.is_some()
+            || nodes.cycle_count.is_some()
+            || nodes.energy_in_mwh.is_some()
+            || nodes.energy_out_mwh.is_some()
+            || nodes.available_charge_kw.is_some()
+            || nodes.available_discharge_kw.is_some()
+    }
+
+    fn telemetry_write_sim_enabled(&self) -> bool {
+        self.cfg.telemetry_write_sim
+    }
+
     async fn write_setpoint(&self, asset_id: Uuid, mw: f64) -> Result<()> {
-        let node = self
-            .cfg
-            .setpoints
-            .get(&asset_id)
-            .cloned()
-            .or_else(|| self.cfg.default_setpoint.clone());
-        let Some(node_id) = node else {
-            return Ok(()); // No mapping; skip silently.
+        let node = self.cfg.setpoints.get(&asset_id).cloned();
+        let (node_id, source) = match node {
+            Some(n) => (n, "asset"),
+            None => match self.cfg.default_setpoint.clone() {
+                Some(n) => (n, "default"),
+                None => {
+                    tracing::warn!(
+                        "opc ua setpoint mapping missing: asset_id={} (no default)",
+                        asset_id
+                    );
+                    return Ok(());
+                }
+            },
         };
+        tracing::info!(
+            "opc ua setpoint write: asset_id={} mw={} mapping={}",
+            asset_id,
+            mw,
+            source
+        );
 
         let write = WriteValue {
             node_id,
             attribute_id: AttributeId::Value as u32,
             index_range: UAString::null(),
             value: DataValue {
-                value: Some(Variant::Double(mw)),
+                value: Some(Variant::Float(mw as f32)),
                 status: None,
                 source_timestamp: None,
                 source_picoseconds: None,
@@ -1277,9 +1854,26 @@ impl OpcUaClient {
         self.write_values(vec![write]).await
     }
 
-    async fn write_telemetry(&self, snap: &Telemetry) -> Result<()> {
-        let mut writes = Vec::new();
+    async fn write_sim_telemetry(&self, snap: &Telemetry) -> Result<()> {
+        if !self.cfg.telemetry_write_sim {
+            return Ok(());
+        }
+
+        if self.cfg.telemetry_interval > Duration::from_secs(0) {
+            let mut guard = self.last_telemetry.lock().await;
+            let now = std::time::Instant::now();
+            let allow = match guard.get(&snap.asset_id) {
+                Some(last) => now.duration_since(*last) >= self.cfg.telemetry_interval,
+                None => true,
+            };
+            if !allow {
+                return Ok(());
+            }
+            guard.insert(snap.asset_id, now);
+        }
+
         let nodes = self.telemetry_nodes_for_asset(snap.asset_id);
+        let mut writes = Vec::new();
 
         if let Some(node) = nodes.current_mw {
             writes.push(WriteValue {
@@ -1287,7 +1881,7 @@ impl OpcUaClient {
                 attribute_id: AttributeId::Value as u32,
                 index_range: UAString::null(),
                 value: DataValue {
-                    value: Some(Variant::Double(snap.current_mw)),
+                    value: Some(Variant::Float(snap.current_mw as f32)),
                     status: None,
                     source_timestamp: None,
                     source_picoseconds: None,
@@ -1302,7 +1896,7 @@ impl OpcUaClient {
                 attribute_id: AttributeId::Value as u32,
                 index_range: UAString::null(),
                 value: DataValue {
-                    value: Some(Variant::Double(snap.soc_pct)),
+                    value: Some(Variant::Float(snap.soc_pct as f32)),
                     status: None,
                     source_timestamp: None,
                     source_picoseconds: None,
@@ -1317,7 +1911,7 @@ impl OpcUaClient {
                 attribute_id: AttributeId::Value as u32,
                 index_range: UAString::null(),
                 value: DataValue {
-                    value: Some(Variant::Double(snap.soc_mwhr)),
+                    value: Some(Variant::Float(snap.soc_mwhr as f32)),
                     status: None,
                     source_timestamp: None,
                     source_picoseconds: None,
@@ -1341,6 +1935,201 @@ impl OpcUaClient {
                 },
             });
         }
+        if let Some(node) = nodes.voltage_v {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.voltage_v as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.current_a {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.current_a as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.dc_bus_v {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.dc_bus_v as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.dc_bus_a {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.dc_bus_a as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_cell_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_cell_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_module_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_module_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.temperature_ambient_f {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.temperature_ambient_f as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.soh_pct {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.soh_pct as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.cycle_count {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::UInt64(snap.cycle_count)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.energy_in_mwh {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.energy_in_mwh as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.energy_out_mwh {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.energy_out_mwh as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.available_charge_kw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.available_charge_kw as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
+        if let Some(node) = nodes.available_discharge_kw {
+            writes.push(WriteValue {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue {
+                    value: Some(Variant::Float(snap.available_discharge_kw as f32)),
+                    status: None,
+                    source_timestamp: None,
+                    source_picoseconds: None,
+                    server_timestamp: None,
+                    server_picoseconds: None,
+                },
+            });
+        }
 
         if writes.is_empty() {
             return Ok(());
@@ -1349,15 +2138,272 @@ impl OpcUaClient {
         self.write_values(writes).await
     }
 
+    async fn read_telemetry(&self, asset_id: Uuid) -> Result<Option<OpcUaTelemetrySample>> {
+        if !self.telemetry_enabled_for_asset(asset_id) {
+            return Ok(None);
+        }
+
+        if self.cfg.telemetry_interval > Duration::from_secs(0) {
+            let mut guard = self.last_telemetry.lock().await;
+            let now = std::time::Instant::now();
+            let allow = match guard.get(&asset_id) {
+                Some(last) => now.duration_since(*last) >= self.cfg.telemetry_interval,
+                None => true,
+            };
+            if !allow {
+                let cache = self.last_sample.lock().await;
+                return Ok(cache.get(&asset_id).cloned());
+            }
+            guard.insert(asset_id, now);
+        }
+
+        let nodes = self.telemetry_nodes_for_asset(asset_id);
+        let mut read_ids = Vec::new();
+        let mut fields = Vec::new();
+
+        if let Some(node) = nodes.current_mw {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::CurrentMw);
+        }
+        if let Some(node) = nodes.soc_pct {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::SocPct);
+        }
+        if let Some(node) = nodes.soc_mwhr {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::SocMwhr);
+        }
+        if let Some(node) = nodes.status {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::Status);
+        }
+        if let Some(node) = nodes.voltage_v {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::VoltageV);
+        }
+        if let Some(node) = nodes.current_a {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::CurrentA);
+        }
+        if let Some(node) = nodes.dc_bus_v {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::DcBusV);
+        }
+        if let Some(node) = nodes.dc_bus_a {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::DcBusA);
+        }
+        if let Some(node) = nodes.temperature_cell_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureCellF);
+        }
+        if let Some(node) = nodes.temperature_module_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureModuleF);
+        }
+        if let Some(node) = nodes.temperature_ambient_f {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::TemperatureAmbientF);
+        }
+        if let Some(node) = nodes.soh_pct {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::SohPct);
+        }
+        if let Some(node) = nodes.cycle_count {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::CycleCount);
+        }
+        if let Some(node) = nodes.energy_in_mwh {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::EnergyInMwh);
+        }
+        if let Some(node) = nodes.energy_out_mwh {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::EnergyOutMwh);
+        }
+        if let Some(node) = nodes.available_charge_kw {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::AvailableChargeKw);
+        }
+        if let Some(node) = nodes.available_discharge_kw {
+            read_ids.push(ReadValueId {
+                node_id: node,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            });
+            fields.push(OpcUaField::AvailableDischargeKw);
+        }
+
+        if read_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let values = match self.read_values_transient(read_ids).await {
+            Ok(values) => values,
+            Err(err) => {
+                let cache = self.last_sample.lock().await;
+                if let Some(sample) = cache.get(&asset_id) {
+                    tracing::warn!(
+                        "opc ua read failed; using cached telemetry asset_id={} err={:?}",
+                        asset_id,
+                        err
+                    );
+                    return Ok(Some(sample.clone()));
+                }
+                return Err(err);
+            }
+        };
+
+        let mut sample = OpcUaTelemetrySample::default();
+        for (field, dv) in fields.iter().zip(values.iter()) {
+            let value = dv.value.as_ref();
+            match field {
+                OpcUaField::CurrentMw => sample.current_mw = value.and_then(variant_to_f64),
+                OpcUaField::SocPct => sample.soc_pct = value.and_then(variant_to_f64),
+                OpcUaField::SocMwhr => sample.soc_mwhr = value.and_then(variant_to_f64),
+                OpcUaField::Status => sample.status = value.and_then(variant_to_string),
+                OpcUaField::VoltageV => sample.voltage_v = value.and_then(variant_to_f64),
+                OpcUaField::CurrentA => sample.current_a = value.and_then(variant_to_f64),
+                OpcUaField::DcBusV => sample.dc_bus_v = value.and_then(variant_to_f64),
+                OpcUaField::DcBusA => sample.dc_bus_a = value.and_then(variant_to_f64),
+                OpcUaField::TemperatureCellF => {
+                    sample.temperature_cell_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::TemperatureModuleF => {
+                    sample.temperature_module_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::TemperatureAmbientF => {
+                    sample.temperature_ambient_f = value.and_then(variant_to_f64)
+                }
+                OpcUaField::SohPct => sample.soh_pct = value.and_then(variant_to_f64),
+                OpcUaField::CycleCount => sample.cycle_count = value.and_then(variant_to_u64),
+                OpcUaField::EnergyInMwh => sample.energy_in_mwh = value.and_then(variant_to_f64),
+                OpcUaField::EnergyOutMwh => sample.energy_out_mwh = value.and_then(variant_to_f64),
+                OpcUaField::AvailableChargeKw => {
+                    sample.available_charge_kw = value.and_then(variant_to_f64)
+                }
+                OpcUaField::AvailableDischargeKw => {
+                    sample.available_discharge_kw = value.and_then(variant_to_f64)
+                }
+            }
+        }
+
+        {
+            let mut cache = self.last_sample.lock().await;
+            cache.insert(asset_id, sample.clone());
+        }
+        Ok(Some(sample))
+    }
+
     async fn write_values(&self, writes: Vec<WriteValue>) -> Result<()> {
+        self.write_values_transient(writes).await
+    }
+
+    async fn get_or_connect_session(
+        &self,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        {
+            let guard = self.session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                return Ok(session.clone());
+            }
+        }
+
         let cfg = self.cfg.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let session = tokio::task::spawn_blocking(move || -> Result<_> {
+            tracing::info!(
+                "opc ua connect endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+
             let mut client = ClientBuilder::new()
                 .application_name("edge_agent_opcua")
                 .application_uri("urn:edge_agent_opcua")
                 .trust_server_certs(true)
                 .create_sample_keypair(true)
-                .session_retry_limit(1)
+                .session_retry_limit(5)
                 .client()
                 .ok_or_else(|| anyhow!("opc ua client build failed"))?;
 
@@ -1374,32 +2420,237 @@ impl OpcUaClient {
                 _ => IdentityToken::Anonymous,
             };
 
-            let session = client
+            client
                 .connect_to_endpoint(endpoint, identity)
-                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua task join error: {e}"))??;
 
-            let result = {
-                let session = session.write();
-                session.write(&writes)
-            };
+        let mut guard = self.session.lock().await;
+        *guard = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn drop_session(&self) {
+        let mut guard = self.session.lock().await;
+        *guard = None;
+    }
+
+    fn connect_once(
+        cfg: &OpcUaConfig,
+        app_name: &str,
+        app_uri: &str,
+    ) -> Result<std::sync::Arc<opcua::sync::RwLock<Session>>> {
+        let mut client = ClientBuilder::new()
+            .application_name(app_name)
+            .application_uri(app_uri)
+            .trust_server_certs(true)
+            .create_sample_keypair(true)
+            .session_retry_limit(0)
+            .client()
+            .ok_or_else(|| anyhow!("opc ua client build failed"))?;
+
+        let endpoint: EndpointDescription = (
+            cfg.endpoint.as_str(),
+            SecurityPolicy::None.to_str(),
+            MessageSecurityMode::None,
+            UserTokenPolicy::anonymous(),
+        )
+            .into();
+
+        let identity = match (cfg.username.clone(), cfg.password.clone()) {
+            (Some(u), Some(p)) => IdentityToken::UserName(u, p),
+            _ => IdentityToken::Anonymous,
+        };
+
+        let session = client
+            .new_session_from_info((endpoint, identity))
+            .map_err(|e| anyhow!("opc ua session build failed: {e}"))?;
+        {
+            let mut guard = session.write();
+            guard
+                .connect_and_activate()
+                .map_err(|e| anyhow!("opc ua connect failed: {e:?}"))?;
+        }
+        Ok(session)
+    }
+
+    async fn write_values_transient(&self, writes: Vec<WriteValue>) -> Result<()> {
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::info!(
+                "opc ua connect (transient write) endpoint={} user={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous")
+            );
+
+            let session = OpcUaClient::connect_once(
+                &cfg,
+                "edge_agent_opcua_write",
+                "urn:edge_agent_opcua_write",
+            )?;
+
+            let session_guard = session.write();
+            let result = session_guard.write(&writes);
 
             match result {
                 Ok(statuses) => {
-                    if !statuses.iter().all(|s| s.is_good()) {
-                        return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+                    if statuses.iter().all(|s| s.is_good()) {
+                        return Ok(());
                     }
+                    if writes.len() > 1 && statuses.iter().any(Self::is_size_limit_error) {
+                        tracing::warn!(
+                            "opc ua write too large; retrying per-node writes count={}",
+                            writes.len()
+                        );
+                        Self::write_values_split(&session_guard, &writes)?;
+                        return Ok(());
+                    }
+                    return Err(anyhow!("opc ua write bad status: {:?}", statuses));
                 }
-                Err(status) => return Err(anyhow!("opc ua write failed: {:?}", status)),
+                Err(status) => {
+                    if writes.len() > 1 && Self::is_size_limit_error(&status) {
+                        tracing::warn!(
+                            "opc ua write too large; retrying per-node writes count={}",
+                            writes.len()
+                        );
+                        Self::write_values_split(&session_guard, &writes)?;
+                        return Ok(());
+                    }
+                    return Err(anyhow!("opc ua write failed: {:?}", status));
+                }
             }
-
-            {
-                let session = session.write();
-                let _ = session.disconnect();
-            }
-
-            Ok(())
         })
         .await
         .map_err(|e| anyhow!("opc ua task join error: {e}"))?
+    }
+
+    fn write_values_split(session: &Session, writes: &[WriteValue]) -> Result<()> {
+        for write in writes {
+            let statuses = session
+                .write(std::slice::from_ref(write))
+                .map_err(|status| anyhow!("opc ua write failed: {:?}", status))?;
+            if !statuses.iter().all(|s| s.is_good()) {
+                return Err(anyhow!("opc ua write bad status: {:?}", statuses));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_size_limit_error(status: &StatusCode) -> bool {
+        matches!(
+            status.status(),
+            StatusCode::BadEncodingLimitsExceeded | StatusCode::BadTcpMessageTooLarge
+        )
+    }
+
+    async fn read_values_transient(
+        &self,
+        read_ids: Vec<ReadValueId>,
+    ) -> Result<Vec<DataValue>> {
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<DataValue>> {
+            tracing::info!(
+                "opc ua connect (transient read) endpoint={} user={} nodes={}",
+                cfg.endpoint,
+                cfg.username.as_deref().unwrap_or("anonymous"),
+                read_ids.len()
+            );
+
+            let session = OpcUaClient::connect_once(
+                &cfg,
+                "edge_agent_opcua_read",
+                "urn:edge_agent_opcua_read",
+            )?;
+
+            let session = session.write();
+            let result = session
+                .read(&read_ids, TimestampsToReturn::Neither, 5_000.0)
+                .map_err(|status| anyhow!("opc ua read failed: {:?}", status));
+            if result.is_ok() {
+                tracing::info!(
+                    "opc ua read ok endpoint={} nodes={}",
+                    cfg.endpoint,
+                    read_ids.len()
+                );
+            }
+            result
+        })
+        .await
+        .map_err(|e| anyhow!("opc ua read join error: {e}"))?
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct OpcUaTelemetrySample {
+    current_mw: Option<f64>,
+    soc_pct: Option<f64>,
+    soc_mwhr: Option<f64>,
+    status: Option<String>,
+    voltage_v: Option<f64>,
+    current_a: Option<f64>,
+    dc_bus_v: Option<f64>,
+    dc_bus_a: Option<f64>,
+    temperature_cell_f: Option<f64>,
+    temperature_module_f: Option<f64>,
+    temperature_ambient_f: Option<f64>,
+    soh_pct: Option<f64>,
+    cycle_count: Option<u64>,
+    energy_in_mwh: Option<f64>,
+    energy_out_mwh: Option<f64>,
+    available_charge_kw: Option<f64>,
+    available_discharge_kw: Option<f64>,
+}
+
+#[derive(Debug)]
+enum OpcUaField {
+    CurrentMw,
+    SocPct,
+    SocMwhr,
+    Status,
+    VoltageV,
+    CurrentA,
+    DcBusV,
+    DcBusA,
+    TemperatureCellF,
+    TemperatureModuleF,
+    TemperatureAmbientF,
+    SohPct,
+    CycleCount,
+    EnergyInMwh,
+    EnergyOutMwh,
+    AvailableChargeKw,
+    AvailableDischargeKw,
+}
+
+fn variant_to_f64(value: &Variant) -> Option<f64> {
+    match value {
+        Variant::Double(v) => Some(*v),
+        Variant::Float(v) => Some(*v as f64),
+        Variant::Int32(v) => Some(*v as f64),
+        Variant::Int64(v) => Some(*v as f64),
+        Variant::UInt32(v) => Some(*v as f64),
+        Variant::UInt64(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+fn variant_to_u64(value: &Variant) -> Option<u64> {
+    match value {
+        Variant::UInt64(v) => Some(*v),
+        Variant::UInt32(v) => Some(*v as u64),
+        Variant::Int64(v) => (*v).try_into().ok(),
+        Variant::Int32(v) => (*v).try_into().ok(),
+        Variant::Double(v) => (*v as i64).try_into().ok(),
+        Variant::Float(v) => (*v as i64).try_into().ok(),
+        _ => None,
+    }
+}
+
+fn variant_to_string(value: &Variant) -> Option<String> {
+    match value {
+        Variant::String(v) => Some(v.to_string()),
+        _ => None,
     }
 }

@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  ignition:
+    image: inductiveautomation/ignition:latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_HTTP_PORT: "8088"
+      GATEWAY_HTTPS_PORT: "8043"
+    ports:
+      - "8088:8088"
+      - "8043:8043"
+      - "62541:62541"
+    volumes:
+      - ignition_latest_data_8_3_1:/usr/local/bin/ignition/data:Z
+
+  ignition_2:
+    image: inductiveautomation/ignition:latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_HTTP_PORT: "8089"
+      GATEWAY_HTTPS_PORT: "8044"
+    ports:
+      - "8089:8089"
+      - "8044:8044"
+      - "62542:62542"
+    volumes:
+      - ignition_latest_data_8_3_1_2:/usr/local/bin/ignition/data:Z
+
+volumes:
+  ignition_latest_data_8_3_1:
+  ignition_latest_data_8_3_1_2:

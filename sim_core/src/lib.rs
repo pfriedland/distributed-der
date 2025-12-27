@@ -42,6 +42,32 @@ pub struct Telemetry {
     pub max_mw: f64,
     pub min_mw: f64,
     pub status: String,
+    #[serde(default)]
+    pub voltage_v: f64,
+    #[serde(default)]
+    pub current_a: f64,
+    #[serde(default)]
+    pub dc_bus_v: f64,
+    #[serde(default)]
+    pub dc_bus_a: f64,
+    #[serde(default)]
+    pub temperature_cell_f: f64,
+    #[serde(default)]
+    pub temperature_module_f: f64,
+    #[serde(default)]
+    pub temperature_ambient_f: f64,
+    #[serde(default)]
+    pub soh_pct: f64,
+    #[serde(default)]
+    pub cycle_count: u64,
+    #[serde(default)]
+    pub energy_in_mwh: f64,
+    #[serde(default)]
+    pub energy_out_mwh: f64,
+    #[serde(default)]
+    pub available_charge_kw: f64,
+    #[serde(default)]
+    pub available_discharge_kw: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -134,6 +160,19 @@ pub fn tick_asset(asset: &Asset, state: &mut BessState, dt_secs: f64) -> Telemet
         max_mw: asset.max_mw,
         min_mw: asset.min_mw,
         status: status.to_string(),
+        voltage_v: 0.0,
+        current_a: 0.0,
+        dc_bus_v: 0.0,
+        dc_bus_a: 0.0,
+        temperature_cell_f: 0.0,
+        temperature_module_f: 0.0,
+        temperature_ambient_f: 0.0,
+        soh_pct: 100.0,
+        cycle_count: 0,
+        energy_in_mwh: 0.0,
+        energy_out_mwh: 0.0,
+        available_charge_kw: (-asset.min_mw).max(0.0) * 1000.0,
+        available_discharge_kw: asset.max_mw.max(0.0) * 1000.0,
     }
 }
 

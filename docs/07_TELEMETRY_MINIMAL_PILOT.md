@@ -3,12 +3,12 @@
 This is intentionally not a “collect every tag” spec.
 
 ## Related documents
-- `README.md` — project entry point and doc index
-- `docs/01_ARCHITECTURE_CURRENT.md` — current system architecture and flows
-- `docs/03_ROADMAP_V1.md` — V1 roadmap (durability, security, UI, adapters)
-- `docs/04_RFC_EDGE_GATEWAY_MODE.md` — gateway mode semantics and routing rules
-- `docs/05_TEST_PLAN_GATEWAY_MODE.md` — gateway mode test plan
-- `docs/06_CUTSHEET.md` — product positioning and narrative
+-  [project entry point and doc index](../README.md)
+-  [current system architecture and flows](docs/01_ARCHITECTURE_CURRENT.md)
+-  [V1 roadmap - durability, security, UI, adapters](docs/03_ROADMAP_V1.md) 
+-  [gateway mode semantics and routing rules](docs/04_RFC_EDGE_GATEWAY_MODE.md)
+-  [gateway mode test plan](docs/05_TEST_PLAN_GATEWAY_MODE.md)
+-  [product positioning and narrative](docs/06_CUTSHEET.md) 
 
 # Minimal Pilot Telemetry Spec (Wind + PV) — V1-friendly
 
